@@ -262,13 +262,13 @@ Phát ra tất cả camera:
 
 ## 7. Home Assistant
 
-### Bước 1 - thêm API key vào `secrets.yaml`
+### 1. Tạo `rest_command`
+
+Thêm API key vào `secrets.yaml`:
 
 ```yaml
 camera_tts_api_key: "CHANGE_THIS_TO_A_LONG_RANDOM_KEY"
 ```
-
-### Bước 2 - thêm REST command
 
 Nếu dùng file riêng, thêm vào `configuration.yaml`:
 
@@ -276,82 +276,117 @@ Nếu dùng file riêng, thêm vào `configuration.yaml`:
 rest_command: !include rest_command.yaml
 ```
 
-Tạo file `rest_command.yaml`:
+Tạo hoặc thêm vào file `rest_command.yaml`:
 
 ```yaml
-camera_tts:
+camera_ezviz_tts:
   url: "http://192.168.31.100:8124/say"
   method: POST
   headers:
     X-API-Key: !secret camera_tts_api_key
+    Content-Type: application/json
   content_type: "application/json"
   timeout: 5
-  payload: >
+  payload: >-
     {
-      "camera": {{ camera | to_json }},
+      {% if camera | default('') | trim != '' %}
+      "camera": {{ camera | trim | to_json }},
+      {% endif %}
       "text": {{ message | to_json }}
     }
 ```
 
 Thay `192.168.31.100` bằng IP máy chạy Docker/Portainer.
 
-Khởi động lại Home Assistant sau khi thêm cấu hình.
+Nếu `camera` để trống, request chỉ gửi nội dung `text` và container tự sử dụng `DEFAULT_CAMERA`.
 
-### Bước 3 - gọi từ Automation / Script
+Ví dụ gọi trực tiếp:
 
 ```yaml
-action: rest_command.camera_tts
+action: rest_command.camera_ezviz_tts
 data:
   camera: gate
   message: "Có người đang đứng trước cổng"
 ```
 
-Camera khác:
+Dùng camera mặc định của container:
 
 ```yaml
-action: rest_command.camera_tts
+action: rest_command.camera_ezviz_tts
 data:
-  camera: yard
-  message: "Có chuyển động ngoài sân"
+  camera: ""
+  message: "Có người đang đứng trước cổng"
 ```
 
-Phát ra tất cả camera:
+### 2. Tạo Script có giao diện nhập Camera + Tin nhắn
+
+Để Home Assistant hiện trực tiếp ô nhập **Camera** và **Tin nhắn** trong giao diện Actions, tạo script sau trong `scripts.yaml`:
 
 ```yaml
-action: rest_command.camera_tts
-data:
-  camera: all
-  message: "Đây là thông báo toàn bộ camera"
+camera_ezviz_tts:
+  alias: Camera EZVIZ TTS
+  description: Phát TTS ra loa camera EZVIZ
+
+  fields:
+    camera:
+      name: Camera
+      description: Để trống để dùng camera mặc định của container
+      required: false
+      selector:
+        text:
+
+    message:
+      name: Tin nhắn
+      description: Nội dung cần phát ra loa camera
+      required: true
+      selector:
+        text:
+          multiline: true
+
+  sequence:
+    - action: rest_command.camera_ezviz_tts
+      data:
+        camera: "{{ camera | default('') }}"
+        message: "{{ message }}"
+
+  mode: queued
+  max: 30
 ```
 
-### Điều chỉnh gain ngay từ Home Assistant
-
-Nếu muốn truyền âm lượng riêng theo từng lần gọi, thêm REST command thứ hai:
+Nếu `configuration.yaml` chưa khai báo file script riêng, thêm:
 
 ```yaml
-camera_tts_gain:
-  url: "http://192.168.31.100:8124/say"
-  method: POST
-  headers:
-    X-API-Key: !secret camera_tts_api_key
-  content_type: "application/json"
-  timeout: 5
-  payload: >
-    {
-      "camera": {{ camera | to_json }},
-      "text": {{ message | to_json }},
-      "gain_db": {{ gain_db | float }}
-    }
+script: !include scripts.yaml
 ```
 
-Gọi:
+Sau đó **Reload Scripts** hoặc khởi động lại Home Assistant.
+
+Trong **Developer Tools → Actions**, chọn:
+
+```text
+script.camera_ezviz_tts
+```
+
+Home Assistant sẽ hiển thị 2 ô:
+
+- **Camera**: có thể nhập `gate`, `yard`, `all`... hoặc để trống để dùng `DEFAULT_CAMERA` của container.
+- **Tin nhắn**: nội dung TTS cần phát.
+
+Ví dụ dùng trong Automation:
 
 ```yaml
-action: rest_command.camera_tts_gain
+action: script.camera_ezviz_tts
 data:
   camera: gate
-  message: "Cảnh báo có người trước cổng"
-  gain_db: 6
+  message: "Có người đang đứng trước cổng"
+```
+
+Dùng camera mặc định:
+
+```yaml
+action: script.camera_ezviz_tts
+data:
+  message: "Có người đang đứng trước cổng"
 ```
 
 ---
