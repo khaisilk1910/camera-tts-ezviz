@@ -73,7 +73,7 @@ services:
       # Giảm độ trễ VoiceTalk nhưng vẫn giữ khoảng đệm an toàn.
       VOICE_START_DELAY_MS: "120"
       VOICE_END_DELAY_MS: "80"
-      SENDER_START_TIMEOUT: "8"
+      SENDER_START_TIMEOUT: "120"
 
       ALLOW_REQUEST_OVERRIDES: "true"
       ALLOW_DUPLICATE_CAMERA_TARGETS: "false"
