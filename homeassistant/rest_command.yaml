@@ -1,0 +1,15 @@
+# Add camera_tts_api_key to secrets.yaml first.
+# Replace 192.168.31.100 with the Docker host IP.
+rest_command:
+  camera_tts:
+    url: "http://192.168.31.100:8124/say"
+    method: POST
+    headers:
+      X-API-Key: !secret camera_tts_api_key
+    content_type: "application/json"
+    timeout: 10
+    payload: >
+      {
+        "camera": {{ camera | default('gate') | to_json }},
+        "text": {{ message | to_json }}
+      }

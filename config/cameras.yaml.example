@@ -1,0 +1,25 @@
+default_camera: gate
+
+defaults:
+  port: 8000
+  voice_chan: 1
+  voice: vi-VN-HoaiMyNeural
+  rate: "+0%"
+  edge_volume: "+0%"
+  gain_db: 4
+  sample_rate: 16000
+  bitrate: 32k
+  queue_size: 20
+
+cameras:
+  gate:
+    ip: "192.168.31.59"
+    username: "admin"
+    password_file: "/run/secrets/cam_gate_password"
+
+  # Example:
+  # yard:
+  #   ip: "192.168.31.60"
+  #   username: "admin"
+  #   password_file: "/run/secrets/cam_yard_password"
+  #   gain_db: 5

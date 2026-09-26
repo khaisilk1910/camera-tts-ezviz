@@ -1,0 +1,53 @@
+version: "3.8"
+
+services:
+  camera-tts:
+    image: ${CAMERA_TTS_IMAGE}
+    environment:
+      CAMERA_TTS_PORT: ${CAMERA_TTS_PORT:-8124}
+      CAMERA_TTS_MAX_TEXT: ${CAMERA_TTS_MAX_TEXT:-500}
+      CAMERA_TTS_PREP_WORKERS: ${CAMERA_TTS_PREP_WORKERS:-4}
+      CAMERA_TTS_SEND_TIMEOUT: ${CAMERA_TTS_SEND_TIMEOUT:-180}
+      CAMERA_TTS_PREP_TIMEOUT: ${CAMERA_TTS_PREP_TIMEOUT:-300}
+      CAMERA_TTS_CONFIG: /config/cameras.yaml
+      CAMERA_TTS_CACHE_DIR: /cache
+      CAMERA_TTS_API_KEY_FILE: /run/secrets/camera_tts_api_key
+      HCNETSDK_ROOT: /opt/hcnetsdk
+      TZ: ${TZ:-Asia/Ho_Chi_Minh}
+    secrets:
+      - camera_tts_api_key
+      - cam_gate_password
+    volumes:
+      - camera_tts_cache:/cache
+      - ${CAMERA_TTS_CONFIG_PATH}:/config/cameras.yaml:ro
+    networks:
+      - host
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.camera_tts == true
+      restart_policy:
+        condition: on-failure
+        delay: 3s
+        max_attempts: 10
+        window: 60s
+      update_config:
+        parallelism: 1
+        order: stop-first
+        failure_action: rollback
+        monitor: 20s
+
+secrets:
+  camera_tts_api_key:
+    external: true
+  cam_gate_password:
+    external: true
+
+volumes:
+  camera_tts_cache:
+
+networks:
+  host:
+    external: true

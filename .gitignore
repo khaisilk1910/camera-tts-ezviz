@@ -1,0 +1,11 @@
+.env
+.env.stack
+config/cameras.yaml
+cache/
+secrets/*
+!secrets/.gitkeep
+*.tar
+*.tar.gz
+*.log
+__pycache__/
+*.pyc

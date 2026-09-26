@@ -1,0 +1,13 @@
+.git
+.github
+.gitignore
+README.md
+*.zip
+*.tar
+*.tar.gz
+cache/
+secrets/*
+!secrets/.gitkeep
+config/cameras.yaml
+.env
+.env.stack
