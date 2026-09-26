@@ -1,21 +1,23 @@
 # Camera TTS EZVIZ
 
-Docker service phát TTS tiếng Việt ra loa camera EZVIZ/Hikvision qua HCNetSDK.
+Docker service phát TTS tiếng Việt ra loa camera EZVIZ/Hikvision qua HCNetSDK, tối ưu để gọi nhanh từ Home Assistant và hỗ trợ nhiều camera.
 
 ## Tính năng
 
 - HCNetSDK được tích hợp sẵn trong Docker image.
-- Phát TTS qua API, phù hợp với Home Assistant.
-- Hỗ trợ nhiều camera.
-- Mỗi camera có queue riêng, các câu TTS cùng camera sẽ chờ nhau và không phát chồng tiếng.
+- Gọi TTS qua REST API, phù hợp Home Assistant.
+- Hỗ trợ nhiều camera bằng `CAMERAS_JSON`.
+- Mỗi camera có queue riêng: các câu cùng camera phát tuần tự, không chồng tiếng.
 - Các camera khác nhau có thể phát đồng thời.
-- API `/say` trả phản hồi nhanh, không chờ phát TTS xong.
-- Giữ phiên đăng nhập HCNetSDK theo từng camera để giảm thời gian khởi động mỗi lần phát.
-- Cache 2 tầng: TTS gốc + AAC cuối cùng; câu lặp lại bỏ qua Edge TTS/FFmpeg khi có thể.
-- Single-flight: nhiều request cùng câu chỉ tạo audio một lần.
-- Chuẩn bị TTS song song nhưng vẫn phát tuần tự theo queue từng camera.
-- Điều chỉnh âm lượng chung hoặc riêng cho từng camera.
-- Cấu hình camera bằng `CAMERAS_JSON`, không cần sửa file trong container.
+- API `/say` trả `202` ngay, không chờ phát xong.
+- Giữ HCNetSDK worker/session theo từng camera để giảm thời gian khởi động mỗi lần phát.
+- Cache 2 tầng: TTS gốc MP3 + AAC cuối cùng gửi camera.
+- Câu đã có AAC cache sẽ bỏ qua Edge TTS và FFmpeg.
+- Single-flight: nhiều request cùng một nội dung/audio chỉ tạo file một lần.
+- Chuẩn bị TTS song song bằng worker pool nhưng vẫn giữ đúng thứ tự phát của từng camera.
+- Có thể pre-cache các câu thường dùng khi container khởi động.
+- Có API kiểm tra cache, camera, trạng thái job và thời gian từng công đoạn.
+- Điều chỉnh âm lượng chung, riêng từng camera hoặc theo từng request.
 
 ---
 
@@ -32,7 +34,7 @@ services:
     network_mode: host
 
     environment:
-      # ===== Các biến cần chỉnh trong Portainer =====
+      # ===== Các biến thường chỉnh trong Portainer =====
       PORT: "${PORT:-8124}"
       API_KEY: "${API_KEY:-change-me-now}"
       DEFAULT_CAMERA: "${DEFAULT_CAMERA:-}"
@@ -40,7 +42,7 @@ services:
       TTS_VOICE: "${TTS_VOICE:-vi-VN-HoaiMyNeural}"
       CAMERAS_JSON: "${CAMERAS_JSON:-}"
 
-      # ===== Cấu hình mặc định =====
+      # ===== Cấu hình chung tối ưu sẵn =====
       TZ: "Asia/Ho_Chi_Minh"
       ALLOW_NO_AUTH: "false"
 
@@ -51,14 +53,12 @@ services:
 
       QUEUE_SIZE: "30"
       MAX_TEXT: "700"
-
       PREP_WORKERS: "4"
       HTTP_THREADS: "8"
 
       SEND_TIMEOUT: "180"
       PREP_TIMEOUT: "300"
       TTS_TIMEOUT: "120"
-
       JOB_HISTORY: "500"
 
       CACHE_DIR: "/cache"
@@ -67,16 +67,19 @@ services:
 
       CAMERA_DEFAULT_PORT: "8000"
       CAMERA_DEFAULT_VOICE_CHAN: "1"
-
       CAMERA_CONNECT_TIMEOUT_MS: "3000"
       CAMERA_RECONNECT_INTERVAL_MS: "10000"
 
+      # Giảm độ trễ VoiceTalk nhưng vẫn giữ khoảng đệm an toàn.
       VOICE_START_DELAY_MS: "120"
       VOICE_END_DELAY_MS: "80"
       SENDER_START_TIMEOUT: "8"
 
       ALLOW_REQUEST_OVERRIDES: "true"
       ALLOW_DUPLICATE_CAMERA_TARGETS: "false"
+
+      # Tùy chọn: pre-cache các câu thường dùng khi container khởi động.
+      # PRECACHE_TEXTS_JSON: '["Có người trước cổng","Có khách đến","Vui lòng đóng cửa"]'
 
     restart: unless-stopped
 
@@ -90,13 +93,13 @@ volumes:
     name: "camera-tts-ezviz-cache"
 ```
 
-Sau đó khai báo các biến trong **Environment variables** của Stack.
+> Stack dùng `network_mode: host`, vì vậy **không cần khai báo `ports:`**. API sẽ lắng nghe trực tiếp trên `PORT` của máy Docker.
 
 ---
 
 ## 2. Environment variables
 
-Cấu hình tối thiểu:
+Cấu hình tối thiểu trong Portainer:
 
 ```env
 PORT=8124
@@ -109,84 +112,84 @@ CAMERAS_JSON={"gate":{"ip":"192.168.31.59","user":"admin","password":"CHANGE_ME"
 
 Ý nghĩa:
 
-- `PORT`: cổng API của Camera TTS.
+- `PORT`: cổng API Camera TTS.
 - `API_KEY`: khóa bảo vệ API.
-- `DEFAULT_CAMERA`: camera mặc định.
-- `TTS_GAIN_DB`: âm lượng chung.
-- `TTS_VOICE`: giọng Edge TTS.
+- `DEFAULT_CAMERA`: camera dùng khi request không truyền `camera`.
+- `TTS_GAIN_DB`: gain mặc định cho tất cả camera.
+- `TTS_VOICE`: giọng Edge TTS mặc định.
 - `CAMERAS_JSON`: danh sách camera.
 
 Sau khi thay đổi Environment, bấm **Update the stack**.
 
+Nếu muốn dùng port `8125`:
+
+```env
+PORT=8125
+```
+
+Sau đó Home Assistant gọi `http://IP_DOCKER:8125/say`.
+
 ---
 
-## 3. Khai báo nhiều camera
+## 3. Khai báo camera
 
-Một camera:
+### Một camera
 
 ```env
 CAMERAS_JSON={"gate":{"ip":"192.168.31.59","user":"admin","password":"PASS_GATE"}}
 ```
 
-Hai camera:
+### Nhiều camera
 
 ```env
-CAMERAS_JSON={"gate":{"ip":"192.168.31.59","user":"admin","password":"PASS_GATE"},"yard":{"ip":"192.168.31.60","user":"admin","password":"PASS_YARD"}}
+CAMERAS_JSON={"gate":{"ip":"192.168.31.59","user":"admin","password":"PASS_GATE"},"yard":{"ip":"192.168.31.60","user":"admin","password":"PASS_YARD"},"kitchen":{"ip":"192.168.31.61","user":"admin","password":"PASS_KITCHEN"}}
 ```
 
-Ba camera:
+Mỗi camera mặc định dùng:
 
-```env
-CAMERAS_JSON={"gate":{"ip":"192.168.31.59","user":"admin","password":"PASS_GATE"},"yard":{"ip":"192.168.31.60","user":"admin","password":"PASS_YARD"},"livingroom":{"ip":"192.168.31.61","user":"admin","password":"PASS_LIVINGROOM"}}
-```
-
-Mỗi camera mặc định sử dụng:
-
-- Port camera: `8000`
+- Port HCNetSDK: `8000`
 - Voice channel: `1`
 - Queue: `30`
-- AAC mono 16 kHz / 32 kbps
-- Âm lượng từ `TTS_GAIN_DB`
+- AAC-LC mono `16 kHz / 32 kbps`
+- Gain từ `TTS_GAIN_DB`
 
 ---
 
 ## 4. Điều chỉnh âm lượng
 
-Âm lượng chung cho tất cả camera:
+Âm lượng chung:
 
 ```env
 TTS_GAIN_DB=4
 ```
 
-Có thể thử lần lượt:
-
-```env
-TTS_GAIN_DB=4
-```
-
-```env
-TTS_GAIN_DB=5
-```
-
-```env
-TTS_GAIN_DB=6
-```
-
-Nên bắt đầu từ `4` và tăng dần. Hệ thống có limiter để giảm nguy cơ clipping khi tăng gain.
+Có thể thử lần lượt `4`, `5`, `6` dB. Nên tăng từng bước để tránh méo tiếng. Pipeline dùng limiter sau gain để hạn chế clipping.
 
 ### Âm lượng riêng từng camera
 
-Ví dụ camera `gate` dùng `7 dB`, còn `yard` dùng mức chung từ `TTS_GAIN_DB`:
+Ví dụ `gate` dùng `7 dB`, `yard` dùng mức chung từ `TTS_GAIN_DB`:
 
 ```env
 CAMERAS_JSON={"gate":{"ip":"192.168.31.59","user":"admin","password":"PASS_GATE","gain_db":7},"yard":{"ip":"192.168.31.60","user":"admin","password":"PASS_YARD"}}
+```
+
+### Âm lượng riêng theo từng request
+
+Khi `ALLOW_REQUEST_OVERRIDES=true`, API có thể nhận:
+
+```json
+{
+  "camera": "gate",
+  "text": "Cảnh báo có người trước cổng",
+  "gain_db": 6
+}
 ```
 
 ---
 
 ## 5. Override nâng cao riêng từng camera
 
-Khi thật sự cần, JSON hỗ trợ các tham số riêng cho từng camera:
+Khi cần, từng camera có thể ghi đè cấu hình chung:
 
 ```json
 {
@@ -208,7 +211,7 @@ Khai báo trong Portainer dưới dạng một dòng:
 CAMERAS_JSON={"gate":{"ip":"192.168.31.59","user":"admin","password":"PASS","port":8000,"voice_chan":1,"gain_db":6,"queue_size":40}}
 ```
 
-Có thể override thêm giọng và audio cho một camera nếu cần:
+Có thể override thêm giọng và audio:
 
 ```json
 {
@@ -226,48 +229,134 @@ Có thể override thêm giọng và audio cho một camera nếu cần:
 }
 ```
 
-Nếu không khai báo các giá trị override, camera tự sử dụng cấu hình chung.
+Nếu không khai báo override, camera tự dùng cấu hình chung.
 
 ---
 
+## 6. Tối ưu tốc độ và cache
 
-### Pre-cache câu thường dùng (tùy chọn)
+### Persistent HCNetSDK worker
 
-Nếu có các câu cố định thường xuyên phát, có thể thêm vào Stack:
+Mỗi camera có một native worker HCNetSDK riêng. Worker được warm-start khi container chạy và giữ phiên làm việc để tránh phải khởi tạo/login lại toàn bộ cho mỗi câu TTS.
+
+Nếu worker hoặc session lỗi, hệ thống có cơ chế khởi động/reconnect lại khi phát.
+
+### Cache 2 tầng
+
+Cache được lưu trong volume `camera_tts_cache`:
+
+```text
+/cache/
+├── base/   # MP3 gốc từ Edge TTS
+└── aac/    # AAC cuối cùng gửi camera
+```
+
+Luồng khi chưa có cache:
+
+```text
+Text → Edge TTS → MP3 cache → FFmpeg → AAC cache → Camera
+```
+
+Luồng khi AAC đã có cache:
+
+```text
+Text → AAC cache HIT → Camera
+```
+
+Nếu chỉ thay `gain_db`, `sample_rate` hoặc `bitrate`, hệ thống có thể dùng MP3 base cache và chỉ tạo lại AAC, không phải gọi Edge TTS lại.
+
+### Single-flight
+
+Nếu nhiều request cùng lúc cần cùng một file audio, chỉ một task tạo audio; các request còn lại dùng chung kết quả đó.
+
+### Chuẩn bị TTS song song
+
+`PREP_WORKERS=4` cho phép chuẩn bị nhiều audio song song. Việc phát trên cùng một camera vẫn tuân theo queue FIFO nên không bị chồng tiếng.
+
+### Chuẩn hóa text
+
+Khoảng trắng đầu/cuối và khoảng trắng lặp được chuẩn hóa trước khi tạo cache key, giúp các nội dung tương đương tái sử dụng cache tốt hơn.
+
+### Pre-cache câu thường dùng
+
+Bỏ dấu `#` trong Stack và khai báo:
 
 ```yaml
-environment:
-  PRECACHE_TEXTS_JSON: '["Có người trước cổng","Có khách đến","Vui lòng đóng cửa"]'
+PRECACHE_TEXTS_JSON: '["Có người trước cổng","Có khách đến","Vui lòng đóng cửa"]'
 ```
 
-Container sẽ tạo cache sau khi khởi động. Khi câu đã có trong cache, request tiếp theo bỏ qua bước gọi Edge TTS và chuyển đổi không cần thiết.
+Container sẽ chuẩn bị các câu này sau khi khởi động. Khi cần phát, nếu audio đã sẵn sàng trong cache thì không cần chờ Edge TTS/FFmpeg.
 
-Kiểm tra cache:
+### Dọn cache tự động
 
-```bash
-curl -H "X-API-Key: YOUR_API_KEY" http://192.168.31.100:8124/cache/stats
+Mặc định:
+
+```yaml
+CACHE_MAX_MB: "512"
+CACHE_TTL_DAYS: "30"
 ```
+
+Hệ thống tự dọn cache cũ và giới hạn dung lượng cache.
 
 ---
 
-## 6. Kiểm tra API
+## 7. Kiểm tra API và hiệu năng
 
-Health check:
+Thay `192.168.31.100` bằng IP máy Docker/Portainer.
+
+### Health
 
 ```bash
 curl http://192.168.31.100:8124/health
 ```
 
-Phát TTS ra camera `gate`:
+Health trả trạng thái camera, queue, persistent sender và thông tin cache.
+
+### Danh sách camera
+
+```bash
+curl -H "X-API-Key: YOUR_API_KEY" \
+  http://192.168.31.100:8124/cameras
+```
+
+### Kiểm tra cache
+
+```bash
+curl -H "X-API-Key: YOUR_API_KEY" \
+  http://192.168.31.100:8124/cache/stats
+```
+
+Các số quan trọng:
+
+- `aac_hits`: dùng trực tiếp AAC cache.
+- `aac_misses`: chưa có AAC phù hợp.
+- `base_hits`: tái sử dụng MP3 gốc.
+- `singleflight_joins`: request đã dùng chung một tác vụ chuẩn bị audio.
+- `generated`: số file AAC đã tạo.
+
+### Phát TTS
 
 ```bash
 curl -X POST http://192.168.31.100:8124/say \
   -H "Content-Type: application/json" \
   -H "X-API-Key: YOUR_API_KEY" \
-  -d '{"camera":"gate","text":"Có người đang đứng trước cổng"}'
+  -d '{"camera":"gate","text":"Xin chào các bạn"}'
 ```
 
-Phát ra nhiều camera:
+API trả `202` cùng `job id` ngay sau khi đưa request vào queue.
+
+Nếu bỏ `camera`:
+
+```bash
+curl -X POST http://192.168.31.100:8124/say \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -d '{"text":"Xin chào các bạn"}'
+```
+
+container dùng `DEFAULT_CAMERA`.
+
+### Nhiều camera
 
 ```json
 {
@@ -276,7 +365,7 @@ Phát ra nhiều camera:
 }
 ```
 
-Phát ra tất cả camera:
+### Tất cả camera
 
 ```json
 {
@@ -285,17 +374,41 @@ Phát ra tất cả camera:
 }
 ```
 
+### Kiểm tra thời gian của một job
+
+Sau khi `/say` trả về `id`, gọi:
+
+```bash
+curl -H "X-API-Key: YOUR_API_KEY" \
+  http://192.168.31.100:8124/jobs/JOB_ID
+```
+
+Kết quả có thể chứa:
+
+- `cache`: `aac-hit`, `generated`, ...
+- `prepare_ms`: thời gian chuẩn bị audio.
+- `playback.sdk_ms`: thời gian native HCNetSDK xử lý phát.
+- `timings.audio_ready_ms`: thời điểm audio sẵn sàng.
+- `timings.play_start_ms`: thời điểm bắt đầu phát.
+- `timings.done_ms`: thời điểm hoàn tất.
+
+Dùng endpoint này để so sánh **lần đầu** và **lần thứ hai cùng một câu** và xác định phần còn gây độ trễ.
+
 ---
 
-## 7. Home Assistant
+## 8. Home Assistant
 
-### 1. Tạo `rest_command`
+### 8.1. Thêm API key
 
-Thêm API key vào `secrets.yaml`:
+Trong `secrets.yaml`:
 
 ```yaml
 camera_tts_api_key: "CHANGE_THIS_TO_A_LONG_RANDOM_KEY"
 ```
+
+Giá trị phải giống `API_KEY` trong Portainer.
+
+### 8.2. REST command
 
 Nếu dùng file riêng, thêm vào `configuration.yaml`:
 
@@ -303,7 +416,7 @@ Nếu dùng file riêng, thêm vào `configuration.yaml`:
 rest_command: !include rest_command.yaml
 ```
 
-Tạo hoặc thêm vào file `rest_command.yaml`:
+Tạo `rest_command.yaml`:
 
 ```yaml
 camera_ezviz_tts:
@@ -323,31 +436,13 @@ camera_ezviz_tts:
     }
 ```
 
-Thay `192.168.31.100` bằng IP máy chạy Docker/Portainer.
+Nếu `camera` để trống, REST command không gửi trường `camera`; container tự dùng `DEFAULT_CAMERA`.
 
-Nếu `camera` để trống, request chỉ gửi nội dung `text` và container tự sử dụng `DEFAULT_CAMERA`.
+Sau khi thêm cấu hình, restart Home Assistant hoặc reload cấu hình phù hợp.
 
-Ví dụ gọi trực tiếp:
+### 8.3. Script có dropdown Camera + ô Tin nhắn
 
-```yaml
-action: rest_command.camera_ezviz_tts
-data:
-  camera: gate
-  message: "Có người đang đứng trước cổng"
-```
-
-Dùng camera mặc định của container:
-
-```yaml
-action: rest_command.camera_ezviz_tts
-data:
-  camera: ""
-  message: "Có người đang đứng trước cổng"
-```
-
-### 2. Tạo Script có giao diện nhập Camera + Tin nhắn
-
-Để Home Assistant hiện trực tiếp ô nhập **Camera** và **Tin nhắn** trong giao diện Actions, tạo script sau trong `scripts.yaml`:
+Thêm vào `scripts.yaml`:
 
 ```yaml
 camera_ezviz_tts:
@@ -392,26 +487,9 @@ camera_ezviz_tts:
   max: 30
 ```
 
-Nếu `configuration.yaml` chưa khai báo file script riêng, thêm:
+Sửa các lựa chọn `gate`, `yard` theo ID camera trong `CAMERAS_JSON`. `custom_value: true` vẫn cho phép nhập ID camera khác.
 
-```yaml
-script: !include scripts.yaml
-```
-
-Sau đó **Reload Scripts** hoặc khởi động lại Home Assistant.
-
-Trong **Developer Tools → Actions**, chọn:
-
-```text
-script.camera_ezviz_tts
-```
-
-Home Assistant sẽ hiển thị 2 ô:
-
-- **Camera**: dropdown `Mặc định`, `gate`, `yard`, `all`; vẫn cho phép nhập giá trị tùy chỉnh. Chọn `Mặc định` để dùng `DEFAULT_CAMERA` của container.
-- **Tin nhắn**: nội dung TTS cần phát.
-
-Ví dụ dùng trong Automation:
+Sau đó dùng trong UI hoặc Automation:
 
 ```yaml
 action: script.camera_ezviz_tts
@@ -425,12 +503,22 @@ Dùng camera mặc định:
 ```yaml
 action: script.camera_ezviz_tts
 data:
-  message: "Có người đang đứng trước cổng"
+  camera: "Mặc định"
+  message: "Xin chào các bạn"
+```
+
+Phát tất cả camera:
+
+```yaml
+action: script.camera_ezviz_tts
+data:
+  camera: all
+  message: "Đây là thông báo toàn bộ camera"
 ```
 
 ---
 
-## Cấu hình khuyến nghị
+## 9. Cấu hình khuyến nghị
 
 ```env
 PORT=8124
@@ -441,4 +529,10 @@ TTS_VOICE=vi-VN-HoaiMyNeural
 CAMERAS_JSON={"gate":{"ip":"192.168.31.59","user":"admin","password":"PASS_GATE"},"yard":{"ip":"192.168.31.60","user":"admin","password":"PASS_YARD"}}
 ```
 
-Sau khi sửa camera, âm lượng hoặc API key trong Portainer, chỉ cần bấm **Update the stack**.
+Nếu có các câu cố định thường xuyên sử dụng, bật thêm pre-cache trong Stack:
+
+```yaml
+PRECACHE_TEXTS_JSON: '["Có người trước cổng","Có khách đến","Vui lòng đóng cửa"]'
+```
+
+Sau khi thay camera, API key, âm lượng hoặc pre-cache trong Portainer, bấm **Update the stack**.
