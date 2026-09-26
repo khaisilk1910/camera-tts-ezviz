@@ -1,213 +1,65 @@
 version: "3.8"
 
+# Camera TTS EZVIZ - Portainer/Swarm compact stack
+#
+# Only settings that are normally changed are exposed as Portainer variables.
+# Stable technical defaults are kept here or inside the application so the
+# Environment variables screen stays short and easy to manage.
+
 services:
   camera-tts:
-    image: "${IMAGE:-ghcr.io/khaisilk1910/camera-tts-ezviz:latest}"
-    hostname: "${HOSTNAME:-camera-tts-ezviz}"
+    image: "ghcr.io/khaisilk1910/camera-tts-ezviz:latest"
+    hostname: "camera-tts-ezviz"
+
     environment:
-      TZ: "${TZ:-Asia/Ho_Chi_Minh}"
+      # ---- Variables normally edited in Portainer ----
       PORT: "${PORT:-8124}"
       API_KEY: "${API_KEY:-change-me-now}"
-      ALLOW_NO_AUTH: "${ALLOW_NO_AUTH:-false}"
       DEFAULT_CAMERA: "${DEFAULT_CAMERA:-}"
-
-      TTS_VOICE: "${TTS_VOICE:-vi-VN-HoaiMyNeural}"
-      TTS_RATE: "${TTS_RATE:-+0%}"
-      TTS_EDGE_VOLUME: "${TTS_EDGE_VOLUME:-+0%}"
       TTS_GAIN_DB: "${TTS_GAIN_DB:-4}"
-      TTS_SAMPLE_RATE: "${TTS_SAMPLE_RATE:-16000}"
-      TTS_BITRATE: "${TTS_BITRATE:-32k}"
-
-      QUEUE_SIZE: "${QUEUE_SIZE:-30}"
-      MAX_TEXT: "${MAX_TEXT:-700}"
-      PREP_WORKERS: "${PREP_WORKERS:-4}"
-      HTTP_THREADS: "${HTTP_THREADS:-8}"
-      SEND_TIMEOUT: "${SEND_TIMEOUT:-180}"
-      PREP_TIMEOUT: "${PREP_TIMEOUT:-300}"
-      TTS_TIMEOUT: "${TTS_TIMEOUT:-120}"
-      JOB_HISTORY: "${JOB_HISTORY:-500}"
-
-      CACHE_DIR: "/cache"
-      CACHE_MAX_MB: "${CACHE_MAX_MB:-512}"
-      CACHE_TTL_DAYS: "${CACHE_TTL_DAYS:-30}"
-
-      CAMERA_DEFAULT_PORT: "${CAMERA_DEFAULT_PORT:-8000}"
-      CAMERA_DEFAULT_VOICE_CHAN: "${CAMERA_DEFAULT_VOICE_CHAN:-1}"
-      CAMERA_CONNECT_TIMEOUT_MS: "${CAMERA_CONNECT_TIMEOUT_MS:-3000}"
-      CAMERA_RECONNECT_INTERVAL_MS: "${CAMERA_RECONNECT_INTERVAL_MS:-10000}"
-      ALLOW_REQUEST_OVERRIDES: "${ALLOW_REQUEST_OVERRIDES:-true}"
-      ALLOW_DUPLICATE_CAMERA_TARGETS: "${ALLOW_DUPLICATE_CAMERA_TARGETS:-false}"
-
-      # Optional unlimited-camera mode. Leave empty when using CAMERA_01_* slots.
+      TTS_VOICE: "${TTS_VOICE:-vi-VN-HoaiMyNeural}"
       CAMERAS_JSON: "${CAMERAS_JSON:-}"
 
-      # Camera slots. Set ENABLED=true for every camera you want to use.
-      CAMERA_01_ENABLED: "${CAMERA_01_ENABLED:-false}"
-      CAMERA_01_ID: "${CAMERA_01_ID:-cam01}"
-      CAMERA_01_IP: "${CAMERA_01_IP:-}"
-      CAMERA_01_PORT: "${CAMERA_01_PORT:-8000}"
-      CAMERA_01_USER: "${CAMERA_01_USER:-admin}"
-      CAMERA_01_PASSWORD: "${CAMERA_01_PASSWORD:-}"
-      CAMERA_01_VOICE_CHAN: "${CAMERA_01_VOICE_CHAN:-1}"
-      CAMERA_01_GAIN_DB: "${CAMERA_01_GAIN_DB:-}"
-      CAMERA_01_QUEUE_SIZE: "${CAMERA_01_QUEUE_SIZE:-}"
+      # ---- Common defaults: normally do not need to edit ----
+      TZ: "Asia/Ho_Chi_Minh"
+      ALLOW_NO_AUTH: "false"
 
-      CAMERA_02_ENABLED: "${CAMERA_02_ENABLED:-false}"
-      CAMERA_02_ID: "${CAMERA_02_ID:-cam02}"
-      CAMERA_02_IP: "${CAMERA_02_IP:-}"
-      CAMERA_02_PORT: "${CAMERA_02_PORT:-8000}"
-      CAMERA_02_USER: "${CAMERA_02_USER:-admin}"
-      CAMERA_02_PASSWORD: "${CAMERA_02_PASSWORD:-}"
-      CAMERA_02_VOICE_CHAN: "${CAMERA_02_VOICE_CHAN:-1}"
-      CAMERA_02_GAIN_DB: "${CAMERA_02_GAIN_DB:-}"
-      CAMERA_02_QUEUE_SIZE: "${CAMERA_02_QUEUE_SIZE:-}"
+      TTS_RATE: "+0%"
+      TTS_EDGE_VOLUME: "+0%"
+      TTS_SAMPLE_RATE: "16000"
+      TTS_BITRATE: "32k"
 
-      CAMERA_03_ENABLED: "${CAMERA_03_ENABLED:-false}"
-      CAMERA_03_ID: "${CAMERA_03_ID:-cam03}"
-      CAMERA_03_IP: "${CAMERA_03_IP:-}"
-      CAMERA_03_PORT: "${CAMERA_03_PORT:-8000}"
-      CAMERA_03_USER: "${CAMERA_03_USER:-admin}"
-      CAMERA_03_PASSWORD: "${CAMERA_03_PASSWORD:-}"
-      CAMERA_03_VOICE_CHAN: "${CAMERA_03_VOICE_CHAN:-1}"
-      CAMERA_03_GAIN_DB: "${CAMERA_03_GAIN_DB:-}"
-      CAMERA_03_QUEUE_SIZE: "${CAMERA_03_QUEUE_SIZE:-}"
+      QUEUE_SIZE: "30"
+      MAX_TEXT: "700"
+      PREP_WORKERS: "4"
+      HTTP_THREADS: "8"
+      SEND_TIMEOUT: "180"
+      PREP_TIMEOUT: "300"
+      TTS_TIMEOUT: "120"
+      JOB_HISTORY: "500"
 
-      CAMERA_04_ENABLED: "${CAMERA_04_ENABLED:-false}"
-      CAMERA_04_ID: "${CAMERA_04_ID:-cam04}"
-      CAMERA_04_IP: "${CAMERA_04_IP:-}"
-      CAMERA_04_PORT: "${CAMERA_04_PORT:-8000}"
-      CAMERA_04_USER: "${CAMERA_04_USER:-admin}"
-      CAMERA_04_PASSWORD: "${CAMERA_04_PASSWORD:-}"
-      CAMERA_04_VOICE_CHAN: "${CAMERA_04_VOICE_CHAN:-1}"
-      CAMERA_04_GAIN_DB: "${CAMERA_04_GAIN_DB:-}"
-      CAMERA_04_QUEUE_SIZE: "${CAMERA_04_QUEUE_SIZE:-}"
+      CACHE_DIR: "/cache"
+      CACHE_MAX_MB: "512"
+      CACHE_TTL_DAYS: "30"
 
-      CAMERA_05_ENABLED: "${CAMERA_05_ENABLED:-false}"
-      CAMERA_05_ID: "${CAMERA_05_ID:-cam05}"
-      CAMERA_05_IP: "${CAMERA_05_IP:-}"
-      CAMERA_05_PORT: "${CAMERA_05_PORT:-8000}"
-      CAMERA_05_USER: "${CAMERA_05_USER:-admin}"
-      CAMERA_05_PASSWORD: "${CAMERA_05_PASSWORD:-}"
-      CAMERA_05_VOICE_CHAN: "${CAMERA_05_VOICE_CHAN:-1}"
-      CAMERA_05_GAIN_DB: "${CAMERA_05_GAIN_DB:-}"
-      CAMERA_05_QUEUE_SIZE: "${CAMERA_05_QUEUE_SIZE:-}"
+      CAMERA_DEFAULT_PORT: "8000"
+      CAMERA_DEFAULT_VOICE_CHAN: "1"
+      CAMERA_CONNECT_TIMEOUT_MS: "3000"
+      CAMERA_RECONNECT_INTERVAL_MS: "10000"
 
-      CAMERA_06_ENABLED: "${CAMERA_06_ENABLED:-false}"
-      CAMERA_06_ID: "${CAMERA_06_ID:-cam06}"
-      CAMERA_06_IP: "${CAMERA_06_IP:-}"
-      CAMERA_06_PORT: "${CAMERA_06_PORT:-8000}"
-      CAMERA_06_USER: "${CAMERA_06_USER:-admin}"
-      CAMERA_06_PASSWORD: "${CAMERA_06_PASSWORD:-}"
-      CAMERA_06_VOICE_CHAN: "${CAMERA_06_VOICE_CHAN:-1}"
-      CAMERA_06_GAIN_DB: "${CAMERA_06_GAIN_DB:-}"
-      CAMERA_06_QUEUE_SIZE: "${CAMERA_06_QUEUE_SIZE:-}"
-
-      CAMERA_07_ENABLED: "${CAMERA_07_ENABLED:-false}"
-      CAMERA_07_ID: "${CAMERA_07_ID:-cam07}"
-      CAMERA_07_IP: "${CAMERA_07_IP:-}"
-      CAMERA_07_PORT: "${CAMERA_07_PORT:-8000}"
-      CAMERA_07_USER: "${CAMERA_07_USER:-admin}"
-      CAMERA_07_PASSWORD: "${CAMERA_07_PASSWORD:-}"
-      CAMERA_07_VOICE_CHAN: "${CAMERA_07_VOICE_CHAN:-1}"
-      CAMERA_07_GAIN_DB: "${CAMERA_07_GAIN_DB:-}"
-      CAMERA_07_QUEUE_SIZE: "${CAMERA_07_QUEUE_SIZE:-}"
-
-      CAMERA_08_ENABLED: "${CAMERA_08_ENABLED:-false}"
-      CAMERA_08_ID: "${CAMERA_08_ID:-cam08}"
-      CAMERA_08_IP: "${CAMERA_08_IP:-}"
-      CAMERA_08_PORT: "${CAMERA_08_PORT:-8000}"
-      CAMERA_08_USER: "${CAMERA_08_USER:-admin}"
-      CAMERA_08_PASSWORD: "${CAMERA_08_PASSWORD:-}"
-      CAMERA_08_VOICE_CHAN: "${CAMERA_08_VOICE_CHAN:-1}"
-      CAMERA_08_GAIN_DB: "${CAMERA_08_GAIN_DB:-}"
-      CAMERA_08_QUEUE_SIZE: "${CAMERA_08_QUEUE_SIZE:-}"
-
-      CAMERA_09_ENABLED: "${CAMERA_09_ENABLED:-false}"
-      CAMERA_09_ID: "${CAMERA_09_ID:-cam09}"
-      CAMERA_09_IP: "${CAMERA_09_IP:-}"
-      CAMERA_09_PORT: "${CAMERA_09_PORT:-8000}"
-      CAMERA_09_USER: "${CAMERA_09_USER:-admin}"
-      CAMERA_09_PASSWORD: "${CAMERA_09_PASSWORD:-}"
-      CAMERA_09_VOICE_CHAN: "${CAMERA_09_VOICE_CHAN:-1}"
-      CAMERA_09_GAIN_DB: "${CAMERA_09_GAIN_DB:-}"
-      CAMERA_09_QUEUE_SIZE: "${CAMERA_09_QUEUE_SIZE:-}"
-
-      CAMERA_10_ENABLED: "${CAMERA_10_ENABLED:-false}"
-      CAMERA_10_ID: "${CAMERA_10_ID:-cam10}"
-      CAMERA_10_IP: "${CAMERA_10_IP:-}"
-      CAMERA_10_PORT: "${CAMERA_10_PORT:-8000}"
-      CAMERA_10_USER: "${CAMERA_10_USER:-admin}"
-      CAMERA_10_PASSWORD: "${CAMERA_10_PASSWORD:-}"
-      CAMERA_10_VOICE_CHAN: "${CAMERA_10_VOICE_CHAN:-1}"
-      CAMERA_10_GAIN_DB: "${CAMERA_10_GAIN_DB:-}"
-      CAMERA_10_QUEUE_SIZE: "${CAMERA_10_QUEUE_SIZE:-}"
-
-      CAMERA_11_ENABLED: "${CAMERA_11_ENABLED:-false}"
-      CAMERA_11_ID: "${CAMERA_11_ID:-cam11}"
-      CAMERA_11_IP: "${CAMERA_11_IP:-}"
-      CAMERA_11_PORT: "${CAMERA_11_PORT:-8000}"
-      CAMERA_11_USER: "${CAMERA_11_USER:-admin}"
-      CAMERA_11_PASSWORD: "${CAMERA_11_PASSWORD:-}"
-      CAMERA_11_VOICE_CHAN: "${CAMERA_11_VOICE_CHAN:-1}"
-      CAMERA_11_GAIN_DB: "${CAMERA_11_GAIN_DB:-}"
-      CAMERA_11_QUEUE_SIZE: "${CAMERA_11_QUEUE_SIZE:-}"
-
-      CAMERA_12_ENABLED: "${CAMERA_12_ENABLED:-false}"
-      CAMERA_12_ID: "${CAMERA_12_ID:-cam12}"
-      CAMERA_12_IP: "${CAMERA_12_IP:-}"
-      CAMERA_12_PORT: "${CAMERA_12_PORT:-8000}"
-      CAMERA_12_USER: "${CAMERA_12_USER:-admin}"
-      CAMERA_12_PASSWORD: "${CAMERA_12_PASSWORD:-}"
-      CAMERA_12_VOICE_CHAN: "${CAMERA_12_VOICE_CHAN:-1}"
-      CAMERA_12_GAIN_DB: "${CAMERA_12_GAIN_DB:-}"
-      CAMERA_12_QUEUE_SIZE: "${CAMERA_12_QUEUE_SIZE:-}"
-
-      CAMERA_13_ENABLED: "${CAMERA_13_ENABLED:-false}"
-      CAMERA_13_ID: "${CAMERA_13_ID:-cam13}"
-      CAMERA_13_IP: "${CAMERA_13_IP:-}"
-      CAMERA_13_PORT: "${CAMERA_13_PORT:-8000}"
-      CAMERA_13_USER: "${CAMERA_13_USER:-admin}"
-      CAMERA_13_PASSWORD: "${CAMERA_13_PASSWORD:-}"
-      CAMERA_13_VOICE_CHAN: "${CAMERA_13_VOICE_CHAN:-1}"
-      CAMERA_13_GAIN_DB: "${CAMERA_13_GAIN_DB:-}"
-      CAMERA_13_QUEUE_SIZE: "${CAMERA_13_QUEUE_SIZE:-}"
-
-      CAMERA_14_ENABLED: "${CAMERA_14_ENABLED:-false}"
-      CAMERA_14_ID: "${CAMERA_14_ID:-cam14}"
-      CAMERA_14_IP: "${CAMERA_14_IP:-}"
-      CAMERA_14_PORT: "${CAMERA_14_PORT:-8000}"
-      CAMERA_14_USER: "${CAMERA_14_USER:-admin}"
-      CAMERA_14_PASSWORD: "${CAMERA_14_PASSWORD:-}"
-      CAMERA_14_VOICE_CHAN: "${CAMERA_14_VOICE_CHAN:-1}"
-      CAMERA_14_GAIN_DB: "${CAMERA_14_GAIN_DB:-}"
-      CAMERA_14_QUEUE_SIZE: "${CAMERA_14_QUEUE_SIZE:-}"
-
-      CAMERA_15_ENABLED: "${CAMERA_15_ENABLED:-false}"
-      CAMERA_15_ID: "${CAMERA_15_ID:-cam15}"
-      CAMERA_15_IP: "${CAMERA_15_IP:-}"
-      CAMERA_15_PORT: "${CAMERA_15_PORT:-8000}"
-      CAMERA_15_USER: "${CAMERA_15_USER:-admin}"
-      CAMERA_15_PASSWORD: "${CAMERA_15_PASSWORD:-}"
-      CAMERA_15_VOICE_CHAN: "${CAMERA_15_VOICE_CHAN:-1}"
-      CAMERA_15_GAIN_DB: "${CAMERA_15_GAIN_DB:-}"
-      CAMERA_15_QUEUE_SIZE: "${CAMERA_15_QUEUE_SIZE:-}"
-
-      CAMERA_16_ENABLED: "${CAMERA_16_ENABLED:-false}"
-      CAMERA_16_ID: "${CAMERA_16_ID:-cam16}"
-      CAMERA_16_IP: "${CAMERA_16_IP:-}"
-      CAMERA_16_PORT: "${CAMERA_16_PORT:-8000}"
-      CAMERA_16_USER: "${CAMERA_16_USER:-admin}"
-      CAMERA_16_PASSWORD: "${CAMERA_16_PASSWORD:-}"
-      CAMERA_16_VOICE_CHAN: "${CAMERA_16_VOICE_CHAN:-1}"
-      CAMERA_16_GAIN_DB: "${CAMERA_16_GAIN_DB:-}"
-      CAMERA_16_QUEUE_SIZE: "${CAMERA_16_QUEUE_SIZE:-}"
+      ALLOW_REQUEST_OVERRIDES: "true"
+      ALLOW_DUPLICATE_CAMERA_TARGETS: "false"
 
     restart: unless-stopped
+
     volumes:
       - camera_tts_cache:/cache
+
     networks:
       - host
+
     stop_grace_period: 15s
+
     deploy:
       mode: replicated
       replicas: 1
@@ -227,7 +79,7 @@ services:
 
 volumes:
   camera_tts_cache:
-    name: "${CACHE_VOLUME_NAME:-camera-tts-ezviz-cache}"
+    name: "camera-tts-ezviz-cache"
 
 networks:
   host:

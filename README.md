@@ -1,5 +1,19 @@
 # Camera TTS EZVIZ v2 - Portainer Environment Stack
 
+
+
+## v2.1.0 - Portainer compact configuration
+
+The recommended Portainer stack now exposes only six variables: `PORT`, `API_KEY`, `DEFAULT_CAMERA`, `TTS_GAIN_DB`, `TTS_VOICE`, and `CAMERAS_JSON`. All stable audio, queue, timeout, cache and HCNetSDK defaults remain configured in the stack/application and do not clutter Portainer's Environment variables screen.
+
+Recommended camera configuration uses one JSON object:
+
+```env
+CAMERAS_JSON={"gate":{"ip":"192.168.31.59","user":"admin","password":"PASS_GATE"},"yard":{"ip":"192.168.31.60","user":"admin","password":"PASS_YARD"}}
+```
+
+All cameras inherit port `8000`, voice channel `1`, queue size `30`, AAC `16 kHz / mono / 32 kbps`, and the global `TTS_GAIN_DB`. A camera can override a setting when needed, for example `"gain_db":6` or `"port":8000`. The older `CAMERA_01_*` parser remains supported by the application for backward compatibility, but those variables are no longer predeclared in the recommended Portainer stack.
+
 Docker/Swarm service for sending Vietnamese TTS to EZVIZ/Hikvision-compatible camera speakers through HCNetSDK.
 
 This version is designed for Portainer Stack use. Camera configuration is read from environment variables, so adding/removing cameras, changing the API port, voice, gain, queue size, or passwords does **not** require editing files over SSH.

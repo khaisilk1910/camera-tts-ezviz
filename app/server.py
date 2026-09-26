@@ -20,7 +20,7 @@ from waitress import serve
 from config import ConfigError, load_cameras, load_settings, parse_float, public_settings, validate_percent
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2.0.0-env-stack")
+APP_VERSION = os.environ.get("APP_VERSION", "2.1.0")
 app = Flask(__name__)
 
 SETTINGS = load_settings()
