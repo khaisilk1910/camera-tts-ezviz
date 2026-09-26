@@ -1,10 +1,5 @@
-alias: "Camera TTS - test gate"
-mode: queued
-max: 20
-triggers: []
-conditions: []
-actions:
-  - action: rest_command.camera_tts
+action:
+  - action: script.camera_ezviz_tts
     data:
       camera: gate
       message: "Có người đang đứng trước cổng"

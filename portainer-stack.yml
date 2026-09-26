@@ -1,18 +1,11 @@
-version: "3.8"
-
-# Camera TTS EZVIZ - Portainer/Swarm compact stack
-#
-# Only settings that are normally changed are exposed as Portainer variables.
-# Stable technical defaults are kept here or inside the application so the
-# Environment variables screen stays short and easy to manage.
-
 services:
   camera-tts:
     image: "ghcr.io/khaisilk1910/camera-tts-ezviz:latest"
     hostname: "camera-tts-ezviz"
+    network_mode: host
 
     environment:
-      # ---- Variables normally edited in Portainer ----
+      # ===== Chỉ các biến thường chỉnh trong Portainer =====
       PORT: "${PORT:-8124}"
       API_KEY: "${API_KEY:-change-me-now}"
       DEFAULT_CAMERA: "${DEFAULT_CAMERA:-}"
@@ -20,10 +13,9 @@ services:
       TTS_VOICE: "${TTS_VOICE:-vi-VN-HoaiMyNeural}"
       CAMERAS_JSON: "${CAMERAS_JSON:-}"
 
-      # ---- Common defaults: normally do not need to edit ----
+      # ===== Cấu hình chung tối ưu sẵn =====
       TZ: "Asia/Ho_Chi_Minh"
       ALLOW_NO_AUTH: "false"
-
       TTS_RATE: "+0%"
       TTS_EDGE_VOLUME: "+0%"
       TTS_SAMPLE_RATE: "16000"
@@ -47,40 +39,22 @@ services:
       CAMERA_CONNECT_TIMEOUT_MS: "3000"
       CAMERA_RECONNECT_INTERVAL_MS: "10000"
 
+      # Giảm thời gian mở/đóng VoiceTalk nhưng vẫn giữ biên an toàn.
+      VOICE_START_DELAY_MS: "120"
+      VOICE_END_DELAY_MS: "80"
+      SENDER_START_TIMEOUT: "8"
+
       ALLOW_REQUEST_OVERRIDES: "true"
       ALLOW_DUPLICATE_CAMERA_TARGETS: "false"
 
-    restart: unless-stopped
+      # Tùy chọn: thêm thủ công vào Stack nếu muốn pre-cache câu cố định.
+      # PRECACHE_TEXTS_JSON: '["Có người trước cổng","Có khách đến"]'
 
+    restart: unless-stopped
     volumes:
       - camera_tts_cache:/cache
-
-    networks:
-      - host
-
     stop_grace_period: 15s
-
-    deploy:
-      mode: replicated
-      replicas: 1
-      restart_policy:
-        condition: on-failure
-        delay: 3s
-        max_attempts: 10
-        window: 60s
-      update_config:
-        parallelism: 1
-        order: stop-first
-        failure_action: rollback
-        monitor: 20s
-      rollback_config:
-        parallelism: 1
-        order: stop-first
 
 volumes:
   camera_tts_cache:
     name: "camera-tts-ezviz-cache"
-
-networks:
-  host:
-    external: true

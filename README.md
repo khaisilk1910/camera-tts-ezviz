@@ -10,7 +10,10 @@ Docker service phát TTS tiếng Việt ra loa camera EZVIZ/Hikvision qua HCNetS
 - Mỗi camera có queue riêng, các câu TTS cùng camera sẽ chờ nhau và không phát chồng tiếng.
 - Các camera khác nhau có thể phát đồng thời.
 - API `/say` trả phản hồi nhanh, không chờ phát TTS xong.
-- Hỗ trợ cache TTS để câu lặp lại phát nhanh hơn.
+- Giữ phiên đăng nhập HCNetSDK theo từng camera để giảm thời gian khởi động mỗi lần phát.
+- Cache 2 tầng: TTS gốc + AAC cuối cùng; câu lặp lại bỏ qua Edge TTS/FFmpeg khi có thể.
+- Single-flight: nhiều request cùng câu chỉ tạo audio một lần.
+- Chuẩn bị TTS song song nhưng vẫn phát tuần tự theo queue từng camera.
 - Điều chỉnh âm lượng chung hoặc riêng cho từng camera.
 - Cấu hình camera bằng `CAMERAS_JSON`, không cần sửa file trong container.
 
@@ -67,6 +70,10 @@ services:
 
       CAMERA_CONNECT_TIMEOUT_MS: "3000"
       CAMERA_RECONNECT_INTERVAL_MS: "10000"
+
+      VOICE_START_DELAY_MS: "120"
+      VOICE_END_DELAY_MS: "80"
+      SENDER_START_TIMEOUT: "8"
 
       ALLOW_REQUEST_OVERRIDES: "true"
       ALLOW_DUPLICATE_CAMERA_TARGETS: "false"
@@ -223,6 +230,26 @@ Nếu không khai báo các giá trị override, camera tự sử dụng cấu h
 
 ---
 
+
+### Pre-cache câu thường dùng (tùy chọn)
+
+Nếu có các câu cố định thường xuyên phát, có thể thêm vào Stack:
+
+```yaml
+environment:
+  PRECACHE_TEXTS_JSON: '["Có người trước cổng","Có khách đến","Vui lòng đóng cửa"]'
+```
+
+Container sẽ tạo cache sau khi khởi động. Khi câu đã có trong cache, request tiếp theo bỏ qua bước gọi Edge TTS và chuyển đổi không cần thiết.
+
+Kiểm tra cache:
+
+```bash
+curl -H "X-API-Key: YOUR_API_KEY" http://192.168.31.100:8124/cache/stats
+```
+
+---
+
 ## 6. Kiểm tra API
 
 Health check:
@@ -330,10 +357,17 @@ camera_ezviz_tts:
   fields:
     camera:
       name: Camera
-      description: Để trống để dùng camera mặc định của container
+      description: Chọn camera; Mặc định sẽ dùng DEFAULT_CAMERA của container
       required: false
+      default: "Mặc định"
       selector:
-        text:
+        select:
+          options:
+            - "Mặc định"
+            - "gate"
+            - "yard"
+            - "all"
+          custom_value: true
 
     message:
       name: Tin nhắn
@@ -346,7 +380,12 @@ camera_ezviz_tts:
   sequence:
     - action: rest_command.camera_ezviz_tts
       data:
-        camera: "{{ camera | default('') }}"
+        camera: >-
+          {% if camera | default('Mặc định') == 'Mặc định' %}
+            {{ '' }}
+          {% else %}
+            {{ camera }}
+          {% endif %}
         message: "{{ message }}"
 
   mode: queued
@@ -369,7 +408,7 @@ script.camera_ezviz_tts
 
 Home Assistant sẽ hiển thị 2 ô:
 
-- **Camera**: có thể nhập `gate`, `yard`, `all`... hoặc để trống để dùng `DEFAULT_CAMERA` của container.
+- **Camera**: dropdown `Mặc định`, `gate`, `yard`, `all`; vẫn cho phép nhập giá trị tùy chỉnh. Chọn `Mặc định` để dùng `DEFAULT_CAMERA` của container.
 - **Tin nhắn**: nội dung TTS cần phát.
 
 Ví dụ dùng trong Automation:

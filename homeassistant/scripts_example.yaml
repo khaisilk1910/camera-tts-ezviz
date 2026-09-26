@@ -1,0 +1,40 @@
+camera_ezviz_tts:
+  alias: Camera EZVIZ TTS
+  description: Phát TTS ra loa camera EZVIZ
+
+  fields:
+    camera:
+      name: Camera
+      description: Chọn camera; Mặc định sẽ dùng DEFAULT_CAMERA của container
+      required: false
+      default: "Mặc định"
+      selector:
+        select:
+          options:
+            - "Mặc định"
+            - "gate"
+            - "yard"
+            - "all"
+          custom_value: true
+
+    message:
+      name: Tin nhắn
+      description: Nội dung cần phát ra loa camera
+      required: true
+      selector:
+        text:
+          multiline: true
+
+  sequence:
+    - action: rest_command.camera_ezviz_tts
+      data:
+        camera: >-
+          {% if camera | default('Mặc định') == 'Mặc định' %}
+            {{ '' }}
+          {% else %}
+            {{ camera }}
+          {% endif %}
+        message: "{{ message }}"
+
+  mode: queued
+  max: 30

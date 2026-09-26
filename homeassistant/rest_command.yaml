@@ -1,29 +1,15 @@
-# Replace 192.168.31.100 and the API key secret with your Docker/Portainer host.
-# Add to configuration.yaml with: rest_command: !include rest_command.yaml
-
-camera_tts:
+camera_ezviz_tts:
   url: "http://192.168.31.100:8124/say"
   method: POST
   headers:
     X-API-Key: !secret camera_tts_api_key
+    Content-Type: application/json
   content_type: "application/json"
   timeout: 5
-  payload: >
+  payload: >-
     {
-      "camera": {{ camera | to_json }},
+      {% if camera | default('') | trim != '' %}
+      "camera": {{ camera | trim | to_json }},
+      {% endif %}
       "text": {{ message | to_json }}
-    }
-
-camera_tts_gain:
-  url: "http://192.168.31.100:8124/say"
-  method: POST
-  headers:
-    X-API-Key: !secret camera_tts_api_key
-  content_type: "application/json"
-  timeout: 5
-  payload: >
-    {
-      "camera": {{ camera | to_json }},
-      "text": {{ message | to_json }},
-      "gain_db": {{ gain_db | float }}
     }

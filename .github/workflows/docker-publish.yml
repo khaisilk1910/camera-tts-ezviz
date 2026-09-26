@@ -26,10 +26,8 @@ jobs:
           python3 -m py_compile app/config.py app/server.py
           python3 -m unittest discover -s tests -v
 
-      - name: Validate Portainer and Swarm stack syntax
-        run: |
-          docker compose -f stack.yml config >/dev/null
-          docker stack config -c stack.yml >/dev/null
+      - name: Validate Portainer Compose stack syntax
+        run: docker compose -f stack.yml config >/dev/null
 
       - name: Set lower-case image name
         shell: bash

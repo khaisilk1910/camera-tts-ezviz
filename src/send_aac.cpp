@@ -2,7 +2,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#include <chrono>
+#include <string>
 #include <vector>
+
 #include "hcnetsdk_common.h"
 
 static void CALLBACK VoiceCallback(
@@ -64,96 +68,235 @@ static bool read_adts_frame(FILE *fp, std::vector<unsigned char> &frame) {
     return true;
 }
 
-int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s /path/file.aac\n", argv[0]);
+class CameraSession {
+public:
+    CameraSession()
+        : user_id_(-1), voice_chan_((DWORD)env_int("VOICE_CHAN", 1)),
+          sample_rate_(env_int("AUDIO_SAMPLE_RATE", 16000)),
+          start_delay_ms_(env_int("VOICE_START_DELAY_MS", 120)),
+          end_delay_ms_(env_int("VOICE_END_DELAY_MS", 80)) {
+        if (sample_rate_ < 8000 || sample_rate_ > 48000) sample_rate_ = 16000;
+        if (start_delay_ms_ < 0) start_delay_ms_ = 0;
+        if (start_delay_ms_ > 2000) start_delay_ms_ = 2000;
+        if (end_delay_ms_ < 0) end_delay_ms_ = 0;
+        if (end_delay_ms_ > 2000) end_delay_ms_ = 2000;
+    }
+
+    ~CameraSession() { logout(); }
+
+    bool login(bool verbose = true) {
+        if (user_id_ >= 0) return true;
+
+        NET_DVR_DEVICEINFO_V40 device;
+        LONG uid = login_camera(&device);
+        if (uid < 0) {
+            if (verbose) {
+                fprintf(stderr, "LOGIN FAILED: %u\n", NET_DVR_GetLastError());
+                fflush(stderr);
+            }
+            return false;
+        }
+
+        user_id_ = uid;
+        if (verbose) {
+            fprintf(stderr, "LOGIN SUCCESS userID=%d\n", (int)user_id_);
+            fflush(stderr);
+        }
+
+        NET_DVR_COMPRESSION_AUDIO audio;
+        memset(&audio, 0, sizeof(audio));
+        if (NET_DVR_GetCurrentAudioCompress(user_id_, &audio)) {
+            fprintf(stderr, "AUDIO codec=%u rate=%u bitrate=%u\n",
+                    audio.byAudioEncType,
+                    audio.byAudioSamplingRate,
+                    audio.byAudioBitRate);
+            if (audio.byAudioEncType != 7) {
+                fprintf(stderr, "WARNING: camera reports non-AAC codec type=%u\n", audio.byAudioEncType);
+            }
+            fflush(stderr);
+        }
+        return true;
+    }
+
+    void logout() {
+        if (user_id_ >= 0) {
+            NET_DVR_Logout(user_id_);
+            user_id_ = -1;
+        }
+    }
+
+    LONG user_id() const { return user_id_; }
+
+    bool play(const std::string &aac_file, unsigned long &frames_sent, long long &elapsed_ms, std::string &error) {
+        // Retry once with a fresh login if the SDK session became stale.
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            if (!login(true)) {
+                error = "login failed error=" + std::to_string((unsigned int)NET_DVR_GetLastError());
+                logout();
+                continue;
+            }
+
+            if (play_once(aac_file, frames_sent, elapsed_ms, error)) {
+                return true;
+            }
+
+            fprintf(stderr, "PLAY attempt %d failed: %s; reconnecting\n", attempt + 1, error.c_str());
+            fflush(stderr);
+            logout();
+            usleep(100000);
+        }
+        return false;
+    }
+
+private:
+    bool play_once(const std::string &aac_file, unsigned long &frames_sent, long long &elapsed_ms, std::string &error) {
+        FILE *fp = fopen(aac_file.c_str(), "rb");
+        if (!fp) {
+            error = "unable to open AAC file";
+            return false;
+        }
+
+        const auto started = std::chrono::steady_clock::now();
+        LONG voice_handle = NET_DVR_StartVoiceCom_MR_V30(user_id_, voice_chan_, VoiceCallback, NULL);
+        if (voice_handle < 0) {
+            error = "voice start failed error=" + std::to_string((unsigned int)NET_DVR_GetLastError());
+            fclose(fp);
+            return false;
+        }
+
+        if (start_delay_ms_ > 0) usleep((useconds_t)start_delay_ms_ * 1000U);
+
+        const useconds_t frame_delay_us = (useconds_t)((1024LL * 1000000LL) / sample_rate_);
+        std::vector<unsigned char> frame;
+        frames_sent = 0;
+        bool send_failed = false;
+
+        while (read_adts_frame(fp, frame)) {
+            ++frames_sent;
+            BOOL ok = NET_DVR_VoiceComSendData(
+                voice_handle,
+                (char *)frame.data(),
+                (DWORD)frame.size()
+            );
+            if (!ok) {
+                error = "send failed frame=" + std::to_string(frames_sent) +
+                        " error=" + std::to_string((unsigned int)NET_DVR_GetLastError());
+                send_failed = true;
+                break;
+            }
+            usleep(frame_delay_us);
+        }
+
+        if (end_delay_ms_ > 0) usleep((useconds_t)end_delay_ms_ * 1000U);
+        NET_DVR_StopVoiceCom(voice_handle);
+        fclose(fp);
+
+        const auto ended = std::chrono::steady_clock::now();
+        elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(ended - started).count();
+
+        if (send_failed || frames_sent == 0) {
+            if (frames_sent == 0 && !send_failed) error = "AAC file contains no ADTS frames";
+            return false;
+        }
+        return true;
+    }
+
+    LONG user_id_;
+    DWORD voice_chan_;
+    int sample_rate_;
+    int start_delay_ms_;
+    int end_delay_ms_;
+};
+
+static int run_worker() {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IOLBF, 0);
+
+    if (!init_hcnetsdk()) {
+        printf("ERR_READY\tSDK_INIT_FAILED\n");
         return 1;
     }
 
-    const char *aac_file = argv[1];
-    int sample_rate = env_int("AUDIO_SAMPLE_RATE", 16000);
-    if (sample_rate < 8000 || sample_rate > 48000) sample_rate = 16000;
-    const useconds_t frame_delay_us = (useconds_t)((1024LL * 1000000LL) / sample_rate);
+    CameraSession session;
+    // Warm login. A temporary camera outage should not kill the worker; PLAY
+    // will retry login when a request arrives.
+    session.login(true);
+    printf("READY\t%d\n", (int)session.user_id());
 
-    if (!init_hcnetsdk()) return 1;
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t len;
 
-    NET_DVR_DEVICEINFO_V40 device;
-    LONG user_id = login_camera(&device);
-    if (user_id < 0) {
-        fprintf(stderr, "LOGIN FAILED: %u\n", NET_DVR_GetLastError());
-        NET_DVR_Cleanup();
-        return 2;
-    }
-    printf("LOGIN SUCCESS userID=%d\n", (int)user_id);
-
-    NET_DVR_COMPRESSION_AUDIO audio;
-    memset(&audio, 0, sizeof(audio));
-    if (NET_DVR_GetCurrentAudioCompress(user_id, &audio)) {
-        printf("Audio codec=%u rate=%u bitrate=%u\n",
-               audio.byAudioEncType,
-               audio.byAudioSamplingRate,
-               audio.byAudioBitRate);
-        if (audio.byAudioEncType != 7) {
-            fprintf(stderr, "WARNING: camera reports non-AAC codec type=%u\n", audio.byAudioEncType);
+    while ((len = getline(&line, &cap, stdin)) >= 0) {
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
         }
-    } else {
-        fprintf(stderr, "WARNING: unable to query camera audio codec, error=%u\n", NET_DVR_GetLastError());
-    }
 
-    FILE *fp = fopen(aac_file, "rb");
-    if (!fp) {
-        perror("fopen");
-        NET_DVR_Logout(user_id);
-        NET_DVR_Cleanup();
-        return 3;
-    }
-
-    DWORD voice_chan = (DWORD)env_int("VOICE_CHAN", 1);
-    LONG voice_handle = NET_DVR_StartVoiceCom_MR_V30(user_id, voice_chan, VoiceCallback, NULL);
-    if (voice_handle < 0) {
-        fprintf(stderr, "VOICE START FAILED: %u\n", NET_DVR_GetLastError());
-        fclose(fp);
-        NET_DVR_Logout(user_id);
-        NET_DVR_Cleanup();
-        return 4;
-    }
-
-    printf("VOICE START SUCCESS handle=%d\n", (int)voice_handle);
-    usleep(300000);
-
-    std::vector<unsigned char> frame;
-    unsigned long frame_number = 0;
-    bool send_failed = false;
-
-    while (read_adts_frame(fp, frame)) {
-        ++frame_number;
-        BOOL ok = NET_DVR_VoiceComSendData(
-            voice_handle,
-            (char *)frame.data(),
-            (DWORD)frame.size()
-        );
-        if (!ok) {
-            fprintf(stderr, "SEND FAILED frame=%lu size=%zu error=%u\n",
-                    frame_number, frame.size(), NET_DVR_GetLastError());
-            send_failed = true;
+        if (strcmp(line, "PING") == 0) {
+            printf("PONG\t%d\n", (int)session.user_id());
+            continue;
+        }
+        if (strcmp(line, "QUIT") == 0) {
+            printf("BYE\n");
             break;
         }
-        usleep(frame_delay_us);
+
+        const char prefix[] = "PLAY\t";
+        if (strncmp(line, prefix, sizeof(prefix) - 1) != 0) {
+            printf("ERR\tBAD_COMMAND\tunsupported command\n");
+            continue;
+        }
+
+        const char *path = line + sizeof(prefix) - 1;
+        if (!*path) {
+            printf("ERR\tBAD_PATH\tempty AAC path\n");
+            continue;
+        }
+
+        unsigned long frames = 0;
+        long long elapsed_ms = 0;
+        std::string error;
+        if (session.play(path, frames, elapsed_ms, error)) {
+            printf("OK\t%lu\t%lld\n", frames, elapsed_ms);
+        } else {
+            printf("ERR\tPLAY_FAILED\t%s\n", error.c_str());
+        }
     }
 
-    printf("Finished. Frames sent: %lu\n", frame_number);
-    usleep(250000);
-
-    NET_DVR_StopVoiceCom(voice_handle);
-    fclose(fp);
-    NET_DVR_Logout(user_id);
+    free(line);
+    session.logout();
     NET_DVR_Cleanup();
+    return 0;
+}
 
-    if (send_failed || frame_number == 0) {
-        fprintf(stderr, "FAILED\n");
-        return 5;
+static int run_once(const char *aac_file) {
+    if (!init_hcnetsdk()) return 1;
+
+    CameraSession session;
+    unsigned long frames = 0;
+    long long elapsed_ms = 0;
+    std::string error;
+    bool ok = session.play(aac_file, frames, elapsed_ms, error);
+
+    if (ok) {
+        printf("DONE frames=%lu elapsed_ms=%lld\n", frames, elapsed_ms);
+    } else {
+        fprintf(stderr, "FAILED: %s\n", error.c_str());
     }
 
-    printf("DONE\n");
-    return 0;
+    session.logout();
+    NET_DVR_Cleanup();
+    return ok ? 0 : 5;
+}
+
+int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--worker") == 0) {
+        return run_worker();
+    }
+    if (argc == 2) {
+        return run_once(argv[1]);
+    }
+
+    fprintf(stderr, "Usage: %s /path/file.aac | --worker\n", argv[0]);
+    return 1;
 }
