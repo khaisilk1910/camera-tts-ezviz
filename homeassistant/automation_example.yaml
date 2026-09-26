@@ -1,11 +1,10 @@
-# Example action inside an automation/script:
-- action: rest_command.camera_tts
-  data:
-    camera: gate
-    message: "Có người đang đứng trước cổng"
-
-# Send the same TTS to every configured camera:
-- action: rest_command.camera_tts
-  data:
-    camera: all
-    message: "Thông báo thử nghiệm toàn bộ camera"
+alias: "Camera TTS - test gate"
+mode: queued
+max: 20
+triggers: []
+conditions: []
+actions:
+  - action: rest_command.camera_tts
+    data:
+      camera: gate
+      message: "Có người đang đứng trước cổng"

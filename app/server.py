@@ -1,131 +1,65 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import hashlib
+import hmac
 import json
 import os
 import queue
-import re
 import subprocess
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
-import yaml
 from flask import Flask, jsonify, request
+from waitress import serve
 
+from config import ConfigError, load_cameras, load_settings, parse_float, public_settings, validate_percent
+
+
+APP_VERSION = os.environ.get("APP_VERSION", "2.0.0-env-stack")
 app = Flask(__name__)
 
-def read_text_secret(path):
-    if not path:
-        return ""
-    p = Path(path)
-    if not p.exists():
-        raise RuntimeError(f"Secret file not found: {p}")
-    return p.read_text(encoding="utf-8").strip()
-
-
-def env_or_file(name, file_name, default=""):
-    value = os.environ.get(name, "").strip()
-    if value:
-        return value
-    file_path = os.environ.get(file_name, "").strip()
-    if file_path:
-        return read_text_secret(file_path)
-    return default
-
-
-API_KEY = env_or_file("CAMERA_TTS_API_KEY", "CAMERA_TTS_API_KEY_FILE", "change-me")
-PORT = int(os.environ.get("CAMERA_TTS_PORT", "8124"))
-MAX_TEXT = int(os.environ.get("CAMERA_TTS_MAX_TEXT", "500"))
-CONFIG_PATH = Path(os.environ.get("CAMERA_TTS_CONFIG", "/config/cameras.yaml"))
-CACHE_DIR = Path(os.environ.get("CAMERA_TTS_CACHE_DIR", "/cache"))
-SEND_AAC = os.environ.get("CAMERA_TTS_SEND_AAC", "/usr/local/bin/send_aac")
-EDGE_TTS = os.environ.get("CAMERA_TTS_EDGE_TTS", "/usr/local/bin/edge-tts")
-FFMPEG = os.environ.get("CAMERA_TTS_FFMPEG", "/usr/bin/ffmpeg")
-HCNETSDK_ROOT = os.environ.get("HCNETSDK_ROOT", "/opt/hcnetsdk")
-PREP_WORKERS = max(1, int(os.environ.get("CAMERA_TTS_PREP_WORKERS", "4")))
-JOB_HISTORY = max(20, int(os.environ.get("CAMERA_TTS_JOB_HISTORY", "300")))
-SEND_TIMEOUT = max(30, int(os.environ.get("CAMERA_TTS_SEND_TIMEOUT", "180")))
-PREP_TIMEOUT = max(60, int(os.environ.get("CAMERA_TTS_PREP_TIMEOUT", "300")))
-
+SETTINGS = load_settings()
+CACHE_DIR = Path(SETTINGS.cache_dir)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
 
-DEFAULTS = {
-    "voice": "vi-VN-HoaiMyNeural",
-    "rate": "+0%",
-    "edge_volume": "+0%",
-    "gain_db": 4.0,
-    "sample_rate": 16000,
-    "bitrate": "32k",
-    "voice_chan": 1,
-    "queue_size": 20,
-}
+CONFIG_ERROR = ""
+try:
+    CAMERAS, DEFAULT_CAMERA = load_cameras(SETTINGS)
+except ConfigError as exc:
+    CAMERAS, DEFAULT_CAMERA = {}, ""
+    CONFIG_ERROR = str(exc)
 
 
 def log(message: str) -> None:
     print(time.strftime("%Y-%m-%d %H:%M:%S"), message, flush=True)
 
 
-def expand_env(value):
-    if isinstance(value, str):
-        return os.path.expandvars(value)
-    if isinstance(value, dict):
-        return {k: expand_env(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [expand_env(v) for v in value]
-    return value
+if SETTINGS.api_key in {"change-me", "change-me-now"} and not SETTINGS.allow_no_auth:
+    log("WARNING: API_KEY is using the default value; change it in the stack environment")
+if CONFIG_ERROR:
+    log(f"CONFIG ERROR: {CONFIG_ERROR}")
+elif not CAMERAS:
+    log("WARNING: no camera is enabled; configure CAMERA_01_* variables and redeploy the stack")
+else:
+    log(f"Configured cameras: {', '.join(CAMERAS.keys())}")
 
-
-def load_config():
-    if not CONFIG_PATH.exists():
-        raise RuntimeError(f"Missing config file: {CONFIG_PATH}")
-    data = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
-    data = expand_env(data)
-    defaults = dict(DEFAULTS)
-    defaults.update(data.get("defaults") or {})
-    cameras = data.get("cameras") or {}
-    if not isinstance(cameras, dict) or not cameras:
-        raise RuntimeError("No cameras configured")
-    normalized = {}
-    for camera_id, cfg in cameras.items():
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+", str(camera_id)):
-            raise RuntimeError(f"Invalid camera id: {camera_id}")
-        merged = dict(defaults)
-        merged.update(cfg or {})
-        password_file = str(merged.get("password_file", "")).strip()
-        if password_file:
-            merged["password"] = read_text_secret(password_file)
-        required = ["ip", "username", "password"]
-        missing = [k for k in required if not str(merged.get(k, "")).strip()]
-        if missing:
-            raise RuntimeError(f"Camera {camera_id}: missing {', '.join(missing)}")
-        merged["port"] = int(merged.get("port", 8000))
-        merged["voice_chan"] = int(merged.get("voice_chan", 1))
-        merged["queue_size"] = int(merged.get("queue_size", 20))
-        merged["sample_rate"] = int(merged.get("sample_rate", 16000))
-        merged["gain_db"] = float(merged.get("gain_db", 4.0))
-        normalized[str(camera_id)] = merged
-    default_camera = str(data.get("default_camera") or "")
-    if not default_camera:
-        default_camera = next(iter(normalized)) if len(normalized) == 1 else ""
-    if default_camera and default_camera not in normalized:
-        raise RuntimeError(f"default_camera '{default_camera}' is not defined")
-    return normalized, default_camera
-
-
-CAMERAS, DEFAULT_CAMERA = load_config()
 
 job_lock = threading.Lock()
-jobs = {}
-job_order = []
-prep_pool = ThreadPoolExecutor(max_workers=PREP_WORKERS, thread_name_prefix="tts-prep")
-prep_locks = {}
-prep_locks_guard = threading.Lock()
+jobs: dict[str, dict[str, Any]] = {}
+job_order: list[str] = []
+prep_pool = ThreadPoolExecutor(max_workers=SETTINGS.prep_workers, thread_name_prefix="tts-prep")
+prep_locks = [threading.Lock() for _ in range(64)]
 enqueue_lock = threading.Lock()
+cache_lock = threading.Lock()
 
 
-def update_job(job_id, **fields):
+def update_job(job_id: str, **fields: Any) -> None:
     with job_lock:
         job = jobs.get(job_id)
         if job:
@@ -133,7 +67,7 @@ def update_job(job_id, **fields):
             job["updated_at"] = time.time()
 
 
-def new_job(camera_id, text):
+def new_job(camera_id: str, text: str) -> dict[str, Any]:
     job_id = uuid.uuid4().hex
     now = time.time()
     job = {
@@ -147,55 +81,119 @@ def new_job(camera_id, text):
     with job_lock:
         jobs[job_id] = job
         job_order.append(job_id)
-        while len(job_order) > JOB_HISTORY:
+        while len(job_order) > SETTINGS.job_history:
             old = job_order.pop(0)
             jobs.pop(old, None)
     return job
 
 
-def job_snapshot(job_id):
+def job_snapshot(job_id: str) -> dict[str, Any] | None:
     with job_lock:
         job = jobs.get(job_id)
         return dict(job) if job else None
 
 
-def get_prep_lock(key):
-    with prep_locks_guard:
-        lock = prep_locks.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            prep_locks[key] = lock
-        return lock
+def prune_cache(min_age_seconds: int = 600) -> None:
+    now = time.time()
+    with cache_lock:
+        files = []
+        total = 0
+        for path in CACHE_DIR.glob("*.aac"):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            if SETTINGS.cache_ttl_days > 0 and now - stat.st_mtime > SETTINGS.cache_ttl_days * 86400:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                continue
+            files.append((stat.st_mtime, stat.st_size, path))
+            total += stat.st_size
+
+        max_bytes = SETTINGS.cache_max_mb * 1024 * 1024
+        if total <= max_bytes:
+            return
+
+        # Keep recently generated/used files to avoid deleting a file between
+        # TTS preparation and HCNetSDK opening it for playback.
+        files.sort(key=lambda item: item[0])
+        target_bytes = int(max_bytes * 0.90)
+        for mtime, size, path in files:
+            if total <= target_bytes:
+                break
+            if now - mtime < min_age_seconds:
+                continue
+            try:
+                path.unlink()
+                total -= size
+            except FileNotFoundError:
+                pass
 
 
-def audio_spec(camera_cfg, text, overrides):
-    voice = str(overrides.get("voice") or camera_cfg.get("voice") or DEFAULTS["voice"])
-    rate = str(overrides.get("rate") or camera_cfg.get("rate") or "+0%")
-    edge_volume = str(overrides.get("edge_volume") or camera_cfg.get("edge_volume") or "+0%")
-    gain_db = float(overrides.get("gain_db") if overrides.get("gain_db") is not None else camera_cfg.get("gain_db", 4.0))
-    sample_rate = int(camera_cfg.get("sample_rate", 16000))
-    bitrate = str(camera_cfg.get("bitrate", "32k"))
+def cache_maintenance_loop() -> None:
+    while True:
+        try:
+            prune_cache()
+        except Exception as exc:
+            log(f"cache maintenance error: {exc}")
+        time.sleep(1800)
+
+
+try:
+    prune_cache(min_age_seconds=0)
+except Exception as exc:
+    log(f"initial cache maintenance error: {exc}")
+threading.Thread(target=cache_maintenance_loop, daemon=True, name="cache-maintenance").start()
+
+
+def audio_spec(camera_cfg: dict[str, Any], text: str, data: dict[str, Any]) -> dict[str, Any]:
+    voice = str(camera_cfg.get("voice") or SETTINGS.tts_voice)
+    rate = str(camera_cfg.get("rate") or SETTINGS.tts_rate)
+    edge_volume = str(camera_cfg.get("edge_volume") or SETTINGS.tts_edge_volume)
+    gain_db = float(camera_cfg.get("gain_db", SETTINGS.tts_gain_db))
+
+    if SETTINGS.allow_request_overrides:
+        if data.get("voice") not in (None, ""):
+            voice = str(data["voice"]).strip()
+        if data.get("rate") not in (None, ""):
+            rate = validate_percent(str(data["rate"]), "rate")
+        if data.get("edge_volume") not in (None, ""):
+            edge_volume = validate_percent(str(data["edge_volume"]), "edge_volume")
+        if data.get("gain_db") not in (None, ""):
+            gain_db = parse_float(data["gain_db"], "gain_db", gain_db, -20.0, 12.0)
+
     return {
         "text": text,
         "voice": voice,
         "rate": rate,
         "edge_volume": edge_volume,
         "gain_db": gain_db,
-        "sample_rate": sample_rate,
-        "bitrate": bitrate,
+        "sample_rate": int(camera_cfg.get("sample_rate", SETTINGS.tts_sample_rate)),
+        "bitrate": str(camera_cfg.get("bitrate", SETTINGS.tts_bitrate)),
     }
 
 
-def prepare_audio(spec):
+def prepare_audio(spec: dict[str, Any]) -> str:
     raw = json.dumps(spec, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     key = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     final_aac = CACHE_DIR / f"{key}.aac"
+
     if final_aac.exists() and final_aac.stat().st_size > 64:
+        try:
+            os.utime(final_aac, None)
+        except OSError:
+            pass
         return str(final_aac)
 
-    lock = get_prep_lock(key)
+    lock = prep_locks[int(key[:8], 16) % len(prep_locks)]
     with lock:
         if final_aac.exists() and final_aac.stat().st_size > 64:
+            try:
+                os.utime(final_aac, None)
+            except OSError:
+                pass
             return str(final_aac)
 
         mp3 = CACHE_DIR / f".{key}.{uuid.uuid4().hex}.mp3"
@@ -203,7 +201,7 @@ def prepare_audio(spec):
         try:
             subprocess.run(
                 [
-                    EDGE_TTS,
+                    SETTINGS.edge_tts,
                     "--voice", spec["voice"],
                     "--rate", spec["rate"],
                     "--volume", spec["edge_volume"],
@@ -211,15 +209,18 @@ def prepare_audio(spec):
                     "--write-media", str(mp3),
                 ],
                 check=True,
-                timeout=90,
+                capture_output=True,
+                text=True,
+                timeout=SETTINGS.tts_timeout,
             )
 
-            gain_db = max(-12.0, min(float(spec["gain_db"]), 12.0))
+            gain_db = max(-20.0, min(float(spec["gain_db"]), 12.0))
             audio_filter = f"volume={gain_db}dB,alimiter=limit=0.97"
             subprocess.run(
                 [
-                    FFMPEG,
+                    SETTINGS.ffmpeg,
                     "-y",
+                    "-hide_banner",
                     "-loglevel", "error",
                     "-i", str(mp3),
                     "-vn",
@@ -233,12 +234,17 @@ def prepare_audio(spec):
                     str(tmp_aac),
                 ],
                 check=True,
-                timeout=90,
+                capture_output=True,
+                text=True,
+                timeout=SETTINGS.tts_timeout,
             )
             if not tmp_aac.exists() or tmp_aac.stat().st_size <= 64:
                 raise RuntimeError("ffmpeg produced an empty AAC file")
             os.replace(tmp_aac, final_aac)
             return str(final_aac)
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or str(exc)).strip()
+            raise RuntimeError(detail[-1200:] if detail else "audio preparation failed") from exc
         finally:
             for path in (mp3, tmp_aac):
                 try:
@@ -247,55 +253,62 @@ def prepare_audio(spec):
                     pass
 
 
-def send_to_camera(camera_id, cfg, aac_file):
+def send_to_camera(camera_id: str, cfg: dict[str, Any], aac_file: str) -> None:
     env = os.environ.copy()
     env.update(
         {
-            "HCNETSDK_ROOT": HCNETSDK_ROOT,
+            "HCNETSDK_ROOT": SETTINGS.hcnetsdk_root,
             "CAMERA_IP": str(cfg["ip"]),
-            "CAMERA_PORT": str(cfg.get("port", 8000)),
+            "CAMERA_PORT": str(cfg.get("port", SETTINGS.camera_default_port)),
             "CAMERA_USER": str(cfg["username"]),
             "CAMERA_PASSWORD": str(cfg["password"]),
-            "VOICE_CHAN": str(cfg.get("voice_chan", 1)),
-            "AUDIO_SAMPLE_RATE": str(cfg.get("sample_rate", 16000)),
-            "LD_LIBRARY_PATH": f"{HCNETSDK_ROOT}/lib:{HCNETSDK_ROOT}/lib/HCNetSDKCom:" + env.get("LD_LIBRARY_PATH", ""),
+            "VOICE_CHAN": str(cfg.get("voice_chan", SETTINGS.camera_default_voice_chan)),
+            "AUDIO_SAMPLE_RATE": str(cfg.get("sample_rate", SETTINGS.tts_sample_rate)),
+            "LD_LIBRARY_PATH": (
+                f"{SETTINGS.hcnetsdk_root}/lib:{SETTINGS.hcnetsdk_root}/lib/HCNetSDKCom:"
+                + env.get("LD_LIBRARY_PATH", "")
+            ),
         }
     )
-    result = subprocess.run(
-        [SEND_AAC, aac_file],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=SEND_TIMEOUT,
-    )
+    try:
+        result = subprocess.run(
+            [SETTINGS.send_aac, aac_file],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=SETTINGS.send_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"camera playback timed out after {SETTINGS.send_timeout}s") from exc
+
     if result.stdout:
-        log(f"[{camera_id}] send_aac: {result.stdout.strip()}")
+        log(f"[{camera_id}] {result.stdout.strip()}")
     if result.stderr:
-        log(f"[{camera_id}] send_aac stderr: {result.stderr.strip()}")
+        log(f"[{camera_id}] stderr: {result.stderr.strip()}")
     if result.returncode != 0:
         raise RuntimeError(f"send_aac exited with code {result.returncode}")
 
 
 class CameraWorker:
-    def __init__(self, camera_id, cfg):
+    def __init__(self, camera_id: str, cfg: dict[str, Any]):
         self.camera_id = camera_id
         self.cfg = cfg
-        self.queue = queue.Queue(maxsize=int(cfg.get("queue_size", 20)))
-        self.current_job = None
+        self.queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=int(cfg.get("queue_size", SETTINGS.queue_size)))
+        self.current_job: str | None = None
         self.thread = threading.Thread(target=self.run, daemon=True, name=f"camera-{camera_id}")
         self.thread.start()
 
-    def enqueue(self, item):
+    def enqueue(self, item: dict[str, Any]) -> None:
         self.queue.put_nowait(item)
 
-    def run(self):
+    def run(self) -> None:
         while True:
             item = self.queue.get()
             job_id = item["job_id"]
             self.current_job = job_id
             try:
                 update_job(job_id, status="preparing")
-                aac_file = item["future"].result(timeout=PREP_TIMEOUT)
+                aac_file = item["future"].result(timeout=SETTINGS.prep_timeout)
                 update_job(job_id, status="playing")
                 log(f"[{job_id}] camera={self.camera_id} PLAY")
                 send_to_camera(self.camera_id, self.cfg, aac_file)
@@ -312,59 +325,66 @@ class CameraWorker:
 WORKERS = {camera_id: CameraWorker(camera_id, cfg) for camera_id, cfg in CAMERAS.items()}
 
 
-def require_auth():
-    return request.headers.get("X-API-Key", "") == API_KEY
+def require_auth() -> bool:
+    if SETTINGS.allow_no_auth:
+        return True
+    supplied = request.headers.get("X-API-Key", "").strip()
+    if not supplied:
+        auth = request.headers.get("Authorization", "").strip()
+        if auth.lower().startswith("bearer "):
+            supplied = auth[7:].strip()
+    return bool(supplied) and hmac.compare_digest(supplied, SETTINGS.api_key)
 
 
-def parse_targets(value):
+def auth_error():
+    return jsonify({"error": "unauthorized"}), 401
+
+
+def parse_targets(value: Any) -> list[str]:
+    if not CAMERAS:
+        raise RuntimeError(CONFIG_ERROR or "no cameras configured")
     if value is None or value == "":
         if not DEFAULT_CAMERA:
-            raise ValueError("camera is required because no default_camera is configured")
-        return [DEFAULT_CAMERA]
-    if value == "all":
-        return list(CAMERAS.keys())
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, list) and value:
-        return [str(x) for x in value]
-    raise ValueError("camera must be a camera id, a list, or 'all'")
+            raise ValueError("camera is required because DEFAULT_CAMERA is not configured")
+        targets = [DEFAULT_CAMERA]
+    elif value == "all":
+        targets = list(CAMERAS.keys())
+    elif isinstance(value, str):
+        targets = [value]
+    elif isinstance(value, list) and value:
+        targets = [str(item) for item in value]
+    else:
+        raise ValueError("camera must be a camera id, a list, or 'all'")
+
+    # Preserve order while preventing the same camera from being enqueued twice.
+    return list(dict.fromkeys(targets))
 
 
-def enqueue_request(camera_value, data):
-    text = str(data.get("text", "")).strip()
+def enqueue_request(camera_value: Any, data: dict[str, Any]) -> list[dict[str, Any]]:
+    text = str(data.get("text", data.get("message", ""))).strip()
     if not text:
         raise ValueError("text is empty")
-    if len(text) > MAX_TEXT:
-        raise ValueError(f"text too long; max={MAX_TEXT}")
+    if len(text) > SETTINGS.max_text:
+        raise ValueError(f"text too long; max={SETTINGS.max_text}")
 
     targets = parse_targets(camera_value)
-    unknown = [x for x in targets if x not in CAMERAS]
+    unknown = [camera_id for camera_id in targets if camera_id not in CAMERAS]
     if unknown:
         raise ValueError(f"unknown camera(s): {', '.join(unknown)}")
 
-    overrides = {
-        "voice": data.get("voice"),
-        "rate": data.get("rate"),
-        "edge_volume": data.get("edge_volume"),
-        "gain_db": data.get("gain_db"),
-    }
+    staged: list[tuple[CameraWorker, dict[str, Any], Any]] = []
+    futures: dict[str, Any] = {}
 
-    staged = []
-    futures = {}
-    # Serialize producers so concurrent Home Assistant requests cannot race
-    # between queue capacity checks and put_nowait(). Camera workers continue
-    # consuming normally while this short critical section runs.
     with enqueue_lock:
         for camera_id in targets:
-            worker = WORKERS[camera_id]
-            if worker.queue.full():
+            if WORKERS[camera_id].queue.full():
                 raise OverflowError(f"queue full for camera: {camera_id}")
 
         for camera_id in targets:
             worker = WORKERS[camera_id]
             cfg = CAMERAS[camera_id]
-            spec = audio_spec(cfg, text, overrides)
-            spec_key = json.dumps(spec, ensure_ascii=False, sort_keys=True)
+            spec = audio_spec(cfg, text, data)
+            spec_key = json.dumps(spec, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             future = futures.get(spec_key)
             if future is None:
                 future = prep_pool.submit(prepare_audio, spec)
@@ -373,76 +393,132 @@ def enqueue_request(camera_value, data):
             worker.enqueue({"job_id": job["id"], "future": future})
             staged.append((worker, job, future))
 
-    return [job_snapshot(job["id"]) for _, job, _ in staged]
+    snapshots = []
+    for _, job, _ in staged:
+        snapshot = job_snapshot(job["id"])
+        if snapshot is not None:
+            snapshots.append(snapshot)
+    return snapshots
+
+
+@app.errorhandler(413)
+def request_too_large(_error):
+    return jsonify({"error": "request body too large"}), 413
+
+
+@app.get("/")
+def root():
+    return jsonify(
+        {
+            "service": "camera-tts-ezviz",
+            "version": APP_VERSION,
+            "status": "ready" if CAMERAS and not CONFIG_ERROR else "needs-configuration",
+            "endpoints": ["/health", "/cameras", "/config", "/say", "/say/<camera_id>", "/jobs/<job_id>"],
+        }
+    )
 
 
 @app.get("/health")
 def health():
-    camera_status = {}
-    for camera_id, worker in WORKERS.items():
-        camera_status[camera_id] = {
-            "queued": worker.queue.qsize(),
-            "current_job": worker.current_job,
+    camera_status = {
+        camera_id: {"queued": worker.queue.qsize(), "current_job": worker.current_job}
+        for camera_id, worker in WORKERS.items()
+    }
+    status = "ok" if CAMERAS and not CONFIG_ERROR else "degraded"
+    result: dict[str, Any] = {
+        "status": status,
+        "version": APP_VERSION,
+        "default_camera": DEFAULT_CAMERA or None,
+        "camera_count": len(CAMERAS),
+        "cameras": camera_status,
+    }
+    if CONFIG_ERROR:
+        result["config_error"] = CONFIG_ERROR
+    elif not CAMERAS:
+        result["config_error"] = "no cameras configured"
+    return jsonify(result)
+
+
+@app.get("/config")
+def config_view():
+    if not require_auth():
+        return auth_error()
+    return jsonify(
+        {
+            "version": APP_VERSION,
+            "settings": public_settings(SETTINGS),
+            "default_camera": DEFAULT_CAMERA or None,
+            "camera_count": len(CAMERAS),
+            "config_error": CONFIG_ERROR or None,
         }
-    return jsonify({"status": "ok", "default_camera": DEFAULT_CAMERA or None, "cameras": camera_status})
+    )
 
 
 @app.get("/cameras")
-def cameras():
+def cameras_view():
     if not require_auth():
-        return jsonify({"error": "unauthorized"}), 401
+        return auth_error()
     result = []
     for camera_id, cfg in CAMERAS.items():
+        worker = WORKERS[camera_id]
         result.append(
             {
                 "id": camera_id,
                 "ip": cfg["ip"],
-                "port": cfg.get("port", 8000),
-                "voice": cfg.get("voice"),
-                "gain_db": cfg.get("gain_db"),
-                "queued": WORKERS[camera_id].queue.qsize(),
+                "port": cfg["port"],
+                "voice_chan": cfg["voice_chan"],
+                "voice": cfg["voice"],
+                "gain_db": cfg["gain_db"],
+                "sample_rate": cfg["sample_rate"],
+                "bitrate": cfg["bitrate"],
+                "queued": worker.queue.qsize(),
+                "current_job": worker.current_job,
             }
         )
     return jsonify({"cameras": result})
 
 
 @app.get("/jobs/<job_id>")
-def job_status(job_id):
+def job_status(job_id: str):
     if not require_auth():
-        return jsonify({"error": "unauthorized"}), 401
+        return auth_error()
     job = job_snapshot(job_id)
     if not job:
         return jsonify({"error": "job not found"}), 404
     return jsonify(job)
 
 
-@app.post("/say")
-def say():
+def handle_say(camera_value: Any, data: dict[str, Any]):
     if not require_auth():
-        return jsonify({"error": "unauthorized"}), 401
-    data = request.get_json(silent=True) or {}
+        return auth_error()
     try:
-        result = enqueue_request(data.get("camera"), data)
+        result = enqueue_request(camera_value, data)
+    except ConfigError as exc:
+        return jsonify({"error": str(exc)}), 400
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except OverflowError as exc:
+        response = jsonify({"error": str(exc)})
+        response.status_code = 429
+        response.headers["Retry-After"] = "2"
+        return response
+    except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 503
     return jsonify({"status": "queued", "jobs": result}), 202
+
+
+@app.post("/say")
+def say():
+    data = request.get_json(silent=True) or {}
+    return handle_say(data.get("camera"), data)
 
 
 @app.post("/say/<camera_id>")
-def say_camera(camera_id):
-    if not require_auth():
-        return jsonify({"error": "unauthorized"}), 401
+def say_camera(camera_id: str):
     data = request.get_json(silent=True) or {}
-    try:
-        result = enqueue_request(camera_id, data)
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-    except OverflowError as exc:
-        return jsonify({"error": str(exc)}), 503
-    return jsonify({"status": "queued", "jobs": result}), 202
+    return handle_say(camera_id, data)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
+    log(f"Starting HTTP API on 0.0.0.0:{SETTINGS.port} with {SETTINGS.http_threads} threads")
+    serve(app, host="0.0.0.0", port=SETTINGS.port, threads=SETTINGS.http_threads)

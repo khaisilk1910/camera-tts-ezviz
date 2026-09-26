@@ -20,49 +20,47 @@ static void CALLBACK VoiceCallback(
 }
 
 static bool read_adts_frame(FILE *fp, std::vector<unsigned char> &frame) {
-    unsigned char h[7];
-    int c;
+    unsigned char header[7];
+    int first;
 
-    while ((c = fgetc(fp)) != EOF) {
-        if ((unsigned char)c != 0xFF) continue;
+    while ((first = fgetc(fp)) != EOF) {
+        if ((unsigned char)first != 0xFF) continue;
 
-        int c2 = fgetc(fp);
-        if (c2 == EOF) return false;
+        int second = fgetc(fp);
+        if (second == EOF) return false;
 
-        if ((((unsigned char)c2) & 0xF6) != 0xF0) {
-            ungetc(c2, fp);
+        if ((((unsigned char)second) & 0xF6) != 0xF0) {
+            ungetc(second, fp);
             continue;
         }
 
-        h[0] = 0xFF;
-        h[1] = (unsigned char)c2;
-
-        if (fread(&h[2], 1, 5, fp) != 5) return false;
+        header[0] = 0xFF;
+        header[1] = (unsigned char)second;
+        if (fread(&header[2], 1, 5, fp) != 5) return false;
         break;
     }
 
-    if (c == EOF) return false;
+    if (first == EOF) return false;
 
-    int frame_length =
-        ((h[3] & 0x03) << 11) |
-        (h[4] << 3) |
-        ((h[5] & 0xE0) >> 5);
+    const int frame_length =
+        ((header[3] & 0x03) << 11) |
+        (header[4] << 3) |
+        ((header[5] & 0xE0) >> 5);
 
     if (frame_length < 7 || frame_length > 8192) {
         fprintf(stderr, "Invalid ADTS frame length: %d\n", frame_length);
         return false;
     }
 
-    frame.resize(frame_length);
-    memcpy(frame.data(), h, 7);
+    frame.resize((size_t)frame_length);
+    memcpy(frame.data(), header, 7);
 
-    int remain = frame_length - 7;
-    if (remain > 0) {
-        if ((int)fread(frame.data() + 7, 1, remain, fp) != remain) {
+    const int remaining = frame_length - 7;
+    if (remaining > 0) {
+        if ((int)fread(frame.data() + 7, 1, (size_t)remaining, fp) != remaining) {
             return false;
         }
     }
-
     return true;
 }
 
@@ -73,18 +71,20 @@ int main(int argc, char **argv) {
     }
 
     const char *aac_file = argv[1];
+    int sample_rate = env_int("AUDIO_SAMPLE_RATE", 16000);
+    if (sample_rate < 8000 || sample_rate > 48000) sample_rate = 16000;
+    const useconds_t frame_delay_us = (useconds_t)((1024LL * 1000000LL) / sample_rate);
+
     if (!init_hcnetsdk()) return 1;
 
     NET_DVR_DEVICEINFO_V40 device;
     LONG user_id = login_camera(&device);
-
     if (user_id < 0) {
         fprintf(stderr, "LOGIN FAILED: %u\n", NET_DVR_GetLastError());
         NET_DVR_Cleanup();
         return 2;
     }
-
-    printf("LOGIN SUCCESS userID=%ld\n", user_id);
+    printf("LOGIN SUCCESS userID=%d\n", (int)user_id);
 
     NET_DVR_COMPRESSION_AUDIO audio;
     memset(&audio, 0, sizeof(audio));
@@ -94,8 +94,10 @@ int main(int argc, char **argv) {
                audio.byAudioSamplingRate,
                audio.byAudioBitRate);
         if (audio.byAudioEncType != 7) {
-            fprintf(stderr, "WARNING: camera codec is not AAC (type 7).\n");
+            fprintf(stderr, "WARNING: camera reports non-AAC codec type=%u\n", audio.byAudioEncType);
         }
+    } else {
+        fprintf(stderr, "WARNING: unable to query camera audio codec, error=%u\n", NET_DVR_GetLastError());
     }
 
     FILE *fp = fopen(aac_file, "rb");
@@ -107,13 +109,7 @@ int main(int argc, char **argv) {
     }
 
     DWORD voice_chan = (DWORD)env_int("VOICE_CHAN", 1);
-    LONG voice_handle = NET_DVR_StartVoiceCom_MR_V30(
-        user_id,
-        voice_chan,
-        VoiceCallback,
-        NULL
-    );
-
+    LONG voice_handle = NET_DVR_StartVoiceCom_MR_V30(user_id, voice_chan, VoiceCallback, NULL);
     if (voice_handle < 0) {
         fprintf(stderr, "VOICE START FAILED: %u\n", NET_DVR_GetLastError());
         fclose(fp);
@@ -122,7 +118,7 @@ int main(int argc, char **argv) {
         return 4;
     }
 
-    printf("VOICE START SUCCESS handle=%ld\n", voice_handle);
+    printf("VOICE START SUCCESS handle=%d\n", (int)voice_handle);
     usleep(300000);
 
     std::vector<unsigned char> frame;
@@ -130,27 +126,18 @@ int main(int argc, char **argv) {
     bool send_failed = false;
 
     while (read_adts_frame(fp, frame)) {
-        frame_number++;
+        ++frame_number;
         BOOL ok = NET_DVR_VoiceComSendData(
             voice_handle,
             (char *)frame.data(),
             (DWORD)frame.size()
         );
-
         if (!ok) {
             fprintf(stderr, "SEND FAILED frame=%lu size=%zu error=%u\n",
-                    frame_number,
-                    frame.size(),
-                    NET_DVR_GetLastError());
+                    frame_number, frame.size(), NET_DVR_GetLastError());
             send_failed = true;
             break;
         }
-
-        // AAC-LC uses 1024 samples/frame. Pace frames according to
-        // the actual sample rate supplied by the bridge.
-        int sample_rate = env_int("AUDIO_SAMPLE_RATE", 16000);
-        if (sample_rate <= 0) sample_rate = 16000;
-        useconds_t frame_delay_us = (useconds_t)((1024LL * 1000000LL) / sample_rate);
         usleep(frame_delay_us);
     }
 
