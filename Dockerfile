@@ -22,7 +22,7 @@ RUN test -f /opt/hcnetsdk/incEn/HCNetSDK.h \
 
 FROM ubuntu:22.04
 
-ARG APP_VERSION=2.0.0
+ARG APP_VERSION=2.0.1
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -56,7 +56,7 @@ WORKDIR /app
 EXPOSE 8124
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD-SHELL curl -fsS "http://127.0.0.1:${PORT:-8124}/health" >/dev/null || exit 1
+  CMD curl -fsS "http://127.0.0.1:${PORT:-8124}/health" >/dev/null || exit 1
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python3", "/app/server.py"]
