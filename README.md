@@ -1,196 +1,247 @@
-# Camera TTS EZVIZ v2 - Portainer Environment Stack
+# Camera TTS EZVIZ
 
+Docker service phát TTS tiếng Việt ra loa camera EZVIZ/Hikvision qua HCNetSDK.
 
+## Tính năng
 
-## v2.1.0 - Portainer compact configuration
+- HCNetSDK được tích hợp sẵn trong Docker image.
+- Phát TTS qua API, phù hợp với Home Assistant.
+- Hỗ trợ nhiều camera.
+- Mỗi camera có queue riêng, các câu TTS cùng camera sẽ chờ nhau và không phát chồng tiếng.
+- Các camera khác nhau có thể phát đồng thời.
+- API `/say` trả phản hồi nhanh, không chờ phát TTS xong.
+- Hỗ trợ cache TTS để câu lặp lại phát nhanh hơn.
+- Điều chỉnh âm lượng chung hoặc riêng cho từng camera.
+- Cấu hình camera bằng `CAMERAS_JSON`, không cần sửa file trong container.
 
-The recommended Portainer stack now exposes only six variables: `PORT`, `API_KEY`, `DEFAULT_CAMERA`, `TTS_GAIN_DB`, `TTS_VOICE`, and `CAMERAS_JSON`. All stable audio, queue, timeout, cache and HCNetSDK defaults remain configured in the stack/application and do not clutter Portainer's Environment variables screen.
+---
 
-Recommended camera configuration uses one JSON object:
+## 1. Stack Portainer
+
+Vào **Portainer → Stacks → Add stack → Web editor** và dùng:
+
+```yaml
+version: "3.8"
+
+services:
+  camera-tts:
+    image: "ghcr.io/khaisilk1910/camera-tts-ezviz:latest"
+    hostname: "camera-tts-ezviz"
+
+    environment:
+      # Các biến cấu hình từ Portainer
+      PORT: "${PORT:-8124}"
+      API_KEY: "${API_KEY:-change-me-now}"
+      DEFAULT_CAMERA: "${DEFAULT_CAMERA:-}"
+      TTS_GAIN_DB: "${TTS_GAIN_DB:-4}"
+      TTS_VOICE: "${TTS_VOICE:-vi-VN-HoaiMyNeural}"
+      CAMERAS_JSON: "${CAMERAS_JSON:-}"
+
+      # Cấu hình chung
+      TZ: "Asia/Ho_Chi_Minh"
+      ALLOW_NO_AUTH: "false"
+      TTS_RATE: "+0%"
+      TTS_EDGE_VOLUME: "+0%"
+      TTS_SAMPLE_RATE: "16000"
+      TTS_BITRATE: "32k"
+      QUEUE_SIZE: "30"
+      MAX_TEXT: "700"
+      PREP_WORKERS: "4"
+      HTTP_THREADS: "8"
+      SEND_TIMEOUT: "180"
+      PREP_TIMEOUT: "300"
+      TTS_TIMEOUT: "120"
+      JOB_HISTORY: "500"
+      CACHE_DIR: "/cache"
+      CACHE_MAX_MB: "512"
+      CACHE_TTL_DAYS: "30"
+      CAMERA_DEFAULT_PORT: "8000"
+      CAMERA_DEFAULT_VOICE_CHAN: "1"
+      CAMERA_CONNECT_TIMEOUT_MS: "3000"
+      CAMERA_RECONNECT_INTERVAL_MS: "10000"
+      ALLOW_REQUEST_OVERRIDES: "true"
+      ALLOW_DUPLICATE_CAMERA_TARGETS: "false"
+
+    volumes:
+      - camera_tts_cache:/cache
+
+    networks:
+      - host
+
+    stop_grace_period: 15s
+
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 3s
+        max_attempts: 10
+        window: 60s
+      update_config:
+        parallelism: 1
+        order: stop-first
+        failure_action: rollback
+        monitor: 20s
+
+volumes:
+  camera_tts_cache:
+    name: "camera-tts-ezviz-cache"
+
+networks:
+  host:
+    external: true
+```
+
+Sau đó khai báo các biến trong **Environment variables** của Stack.
+
+---
+
+## 2. Environment variables
+
+Cấu hình tối thiểu:
+
+```env
+PORT=8124
+API_KEY=CHANGE_THIS_TO_A_LONG_RANDOM_KEY
+DEFAULT_CAMERA=gate
+TTS_GAIN_DB=4
+TTS_VOICE=vi-VN-HoaiMyNeural
+CAMERAS_JSON={"gate":{"ip":"192.168.31.59","user":"admin","password":"CHANGE_ME"}}
+```
+
+Ý nghĩa:
+
+- `PORT`: cổng API của Camera TTS.
+- `API_KEY`: khóa bảo vệ API.
+- `DEFAULT_CAMERA`: camera mặc định.
+- `TTS_GAIN_DB`: âm lượng chung.
+- `TTS_VOICE`: giọng Edge TTS.
+- `CAMERAS_JSON`: danh sách camera.
+
+Sau khi thay đổi Environment, bấm **Update the stack**.
+
+---
+
+## 3. Khai báo nhiều camera
+
+Một camera:
+
+```env
+CAMERAS_JSON={"gate":{"ip":"192.168.31.59","user":"admin","password":"PASS_GATE"}}
+```
+
+Hai camera:
 
 ```env
 CAMERAS_JSON={"gate":{"ip":"192.168.31.59","user":"admin","password":"PASS_GATE"},"yard":{"ip":"192.168.31.60","user":"admin","password":"PASS_YARD"}}
 ```
 
-All cameras inherit port `8000`, voice channel `1`, queue size `30`, AAC `16 kHz / mono / 32 kbps`, and the global `TTS_GAIN_DB`. A camera can override a setting when needed, for example `"gain_db":6` or `"port":8000`. The older `CAMERA_01_*` parser remains supported by the application for backward compatibility, but those variables are no longer predeclared in the recommended Portainer stack.
-
-Docker/Swarm service for sending Vietnamese TTS to EZVIZ/Hikvision-compatible camera speakers through HCNetSDK.
-
-This version is designed for Portainer Stack use. Camera configuration is read from environment variables, so adding/removing cameras, changing the API port, voice, gain, queue size, or passwords does **not** require editing files over SSH.
-
-## Main characteristics
-
-- HCNetSDK is embedded in the Docker image.
-- `send_aac` is compiled into the image during GitHub Actions build.
-- Edge TTS -> FFmpeg -> AAC-LC/ADTS -> HCNetSDK voice talk.
-- Default audio: mono, 16 kHz, AAC-LC, 32 kbps.
-- One FIFO worker per camera: messages for the same camera never overlap.
-- Different cameras can play concurrently.
-- `/say` returns HTTP 202 immediately after the job is accepted, which is suitable for Home Assistant REST calls.
-- TTS/AAC cache reduces latency for repeated messages.
-- Global volume through `TTS_GAIN_DB` and optional per-camera volume through `CAMERA_XX_GAIN_DB`.
-- 16 camera slots are exposed directly in the Portainer environment UI.
-- `CAMERAS_JSON` supports an arbitrary number of cameras if more than 16 are needed.
-- GitHub Actions automatically validates, builds, and pushes `linux/amd64` images to GHCR on every push to `main`.
-- Optional `PORTAINER_WEBHOOK_URL` GitHub secret can trigger a Portainer redeploy after a successful image push.
-
-> The supplied HCNetSDK binary is x86-64 Linux, so the image is intentionally built only for `linux/amd64`.
-
-## 1. Portainer Stack - no SSH camera editing
-
-Open Portainer -> Stacks -> Add stack -> Web editor, then paste `stack.yml` from this repository.
-
-In **Environment variables**, the minimum useful configuration is:
+Ba camera:
 
 ```env
-IMAGE=ghcr.io/khaisilk1910/camera-tts-ezviz:latest
-PORT=8124
-API_KEY=replace-with-a-long-random-key
-TZ=Asia/Ho_Chi_Minh
-CACHE_VOLUME_NAME=camera-tts-ezviz-cache
-
-TTS_VOICE=vi-VN-HoaiMyNeural
-TTS_RATE=+0%
-TTS_EDGE_VOLUME=+0%
-TTS_GAIN_DB=4
-TTS_SAMPLE_RATE=16000
-TTS_BITRATE=32k
-
-QUEUE_SIZE=30
-PREP_WORKERS=4
-HTTP_THREADS=8
-
-DEFAULT_CAMERA=gate
-
-CAMERA_01_ENABLED=true
-CAMERA_01_ID=gate
-CAMERA_01_IP=192.168.31.59
-CAMERA_01_PORT=8000
-CAMERA_01_USER=admin
-CAMERA_01_PASSWORD=your-camera-password
-CAMERA_01_VOICE_CHAN=1
-CAMERA_01_GAIN_DB=4
-CAMERA_01_QUEUE_SIZE=30
+CAMERAS_JSON={"gate":{"ip":"192.168.31.59","user":"admin","password":"PASS_GATE"},"yard":{"ip":"192.168.31.60","user":"admin","password":"PASS_YARD"},"livingroom":{"ip":"192.168.31.61","user":"admin","password":"PASS_LIVINGROOM"}}
 ```
 
-Deploy the stack. The service listens directly on the Swarm node through the host network, so `PORT=8124` means the API is available on:
+Mỗi camera mặc định sử dụng:
 
-```text
-http://DOCKER_HOST_IP:8124
-```
+- Port camera: `8000`
+- Voice channel: `1`
+- Queue: `30`
+- AAC mono 16 kHz / 32 kbps
+- Âm lượng từ `TTS_GAIN_DB`
 
-### Why there is no `/opt/...` install path
+---
 
-A Swarm container image is managed by Docker's image storage; it is not installed into a normal application directory. To avoid any SSH preparation of host directories, this stack uses a Docker named volume for the TTS cache. Change its name with:
+## 4. Điều chỉnh âm lượng
 
-```env
-CACHE_VOLUME_NAME=camera-tts-ezviz-cache
-```
-
-Portainer/Docker creates the volume. No `mkdir`, `chmod`, or bind-mount preparation is required.
-
-## 2. Add, remove, or disable cameras from Portainer
-
-To add camera 02, add/edit environment variables and then click **Update the stack**:
-
-```env
-CAMERA_02_ENABLED=true
-CAMERA_02_ID=yard
-CAMERA_02_IP=192.168.31.60
-CAMERA_02_PORT=8000
-CAMERA_02_USER=admin
-CAMERA_02_PASSWORD=your-second-password
-CAMERA_02_VOICE_CHAN=1
-CAMERA_02_GAIN_DB=5
-CAMERA_02_QUEUE_SIZE=30
-```
-
-To disable it without deleting the other values:
-
-```env
-CAMERA_02_ENABLED=false
-```
-
-Slots `CAMERA_01_*` through `CAMERA_16_*` are already present in `stack.yml`.
-
-The application rejects duplicate `(IP, port, voice channel)` targets by default. This prevents accidentally defining the same physical camera under two IDs and defeating the per-camera queue. Only set `ALLOW_DUPLICATE_CAMERA_TARGETS=true` if that behavior is intentional.
-
-## 3. More than 16 cameras
-
-Leave the indexed slots disabled and set `CAMERAS_JSON`:
-
-```env
-CAMERAS_JSON=[{"id":"gate","ip":"192.168.31.59","port":8000,"user":"admin","password":"pass1","gain_db":4},{"id":"yard","ip":"192.168.31.60","port":8000,"user":"admin","password":"pass2","gain_db":5}]
-```
-
-`CAMERAS_JSON` and enabled indexed slots can also be combined, but all camera IDs and physical targets must remain unique unless duplicate-target protection is explicitly disabled.
-
-## 4. Volume / loudness
-
-Global digital gain:
+Âm lượng chung cho tất cả camera:
 
 ```env
 TTS_GAIN_DB=4
 ```
 
-Recommended starting range for normal speech is approximately `3` to `6` dB. The application accepts `-20` to `+12` dB and applies an FFmpeg limiter after gain to reduce clipping.
-
-Per-camera override:
+Có thể thử lần lượt:
 
 ```env
-CAMERA_01_GAIN_DB=6
-CAMERA_02_GAIN_DB=3
+TTS_GAIN_DB=4
 ```
-
-If `CAMERA_XX_GAIN_DB` is blank, that camera inherits `TTS_GAIN_DB`.
-
-Edge TTS synthesis volume can also be changed separately:
 
 ```env
-TTS_EDGE_VOLUME=+0%
+TTS_GAIN_DB=5
 ```
-
-Normally keep `TTS_EDGE_VOLUME=+0%` and tune `TTS_GAIN_DB` first.
-
-## 5. Performance and queue settings
-
-Useful variables:
 
 ```env
-QUEUE_SIZE=30
-PREP_WORKERS=4
-HTTP_THREADS=8
-TTS_TIMEOUT=120
-PREP_TIMEOUT=300
-SEND_TIMEOUT=180
-CACHE_MAX_MB=512
-CACHE_TTL_DAYS=30
+TTS_GAIN_DB=6
 ```
 
-- `QUEUE_SIZE`: maximum pending jobs for each camera.
-- `PREP_WORKERS`: number of parallel Edge TTS/FFmpeg preparation workers.
-- `HTTP_THREADS`: Waitress API worker threads.
-- `CACHE_MAX_MB`: soft cache limit. Old AAC files are pruned in the background.
-- `CACHE_TTL_DAYS`: cached AAC age limit; set `0` to disable age-based expiry.
+Nên bắt đầu từ `4` và tăng dần. Hệ thống có limiter để giảm nguy cơ clipping khi tăng gain.
 
-A repeated sentence with identical TTS parameters reuses its cached AAC file.
+### Âm lượng riêng từng camera
 
-## 6. API
+Ví dụ camera `gate` dùng `7 dB`, còn `yard` dùng mức chung từ `TTS_GAIN_DB`:
 
-Health does not require authentication:
+```env
+CAMERAS_JSON={"gate":{"ip":"192.168.31.59","user":"admin","password":"PASS_GATE","gain_db":7},"yard":{"ip":"192.168.31.60","user":"admin","password":"PASS_YARD"}}
+```
+
+---
+
+## 5. Override nâng cao riêng từng camera
+
+Khi thật sự cần, JSON hỗ trợ các tham số riêng cho từng camera:
+
+```json
+{
+  "gate": {
+    "ip": "192.168.31.59",
+    "user": "admin",
+    "password": "PASS",
+    "port": 8000,
+    "voice_chan": 1,
+    "gain_db": 6,
+    "queue_size": 40
+  }
+}
+```
+
+Khai báo trong Portainer dưới dạng một dòng:
+
+```env
+CAMERAS_JSON={"gate":{"ip":"192.168.31.59","user":"admin","password":"PASS","port":8000,"voice_chan":1,"gain_db":6,"queue_size":40}}
+```
+
+Có thể override thêm giọng và audio cho một camera nếu cần:
+
+```json
+{
+  "gate": {
+    "ip": "192.168.31.59",
+    "user": "admin",
+    "password": "PASS",
+    "voice": "vi-VN-HoaiMyNeural",
+    "rate": "+0%",
+    "edge_volume": "+0%",
+    "gain_db": 6,
+    "sample_rate": 16000,
+    "bitrate": "32k"
+  }
+}
+```
+
+Nếu không khai báo các giá trị override, camera tự sử dụng cấu hình chung.
+
+---
+
+## 6. Kiểm tra API
+
+Health check:
 
 ```bash
 curl http://192.168.31.100:8124/health
 ```
 
-List configured cameras:
-
-```bash
-curl http://192.168.31.100:8124/cameras \
-  -H "X-API-Key: YOUR_API_KEY"
-```
-
-Speak on one camera:
+Phát TTS ra camera `gate`:
 
 ```bash
 curl -X POST http://192.168.31.100:8124/say \
@@ -199,7 +250,7 @@ curl -X POST http://192.168.31.100:8124/say \
   -d '{"camera":"gate","text":"Có người đang đứng trước cổng"}'
 ```
 
-Speak on multiple cameras:
+Phát ra nhiều camera:
 
 ```json
 {
@@ -208,7 +259,7 @@ Speak on multiple cameras:
 }
 ```
 
-Speak on all cameras:
+Phát ra tất cả camera:
 
 ```json
 {
@@ -217,99 +268,113 @@ Speak on all cameras:
 }
 ```
 
-Optional per-request gain (enabled by default with `ALLOW_REQUEST_OVERRIDES=true`):
-
-```json
-{
-  "camera": "gate",
-  "text": "Cảnh báo có người trước cổng",
-  "gain_db": 6
-}
-```
-
-The server also accepts `message` as an alias for `text`.
+---
 
 ## 7. Home Assistant
 
-Copy the examples in `homeassistant/` or add the equivalent configuration.
-
-Example action:
+### Bước 1 - thêm API key vào `secrets.yaml`
 
 ```yaml
-- action: rest_command.camera_tts
-  data:
-    camera: gate
-    message: "Có người đang đứng trước cổng"
+camera_tts_api_key: "CHANGE_THIS_TO_A_LONG_RANDOM_KEY"
 ```
 
-The API accepts the request and returns `202` before playback completes. Actual playback is then serialized by the camera's queue.
+### Bước 2 - thêm REST command
 
-## 8. GitHub Actions / GHCR
+Nếu dùng file riêng, thêm vào `configuration.yaml`:
 
-The workflow is in:
-
-```text
-.github/workflows/docker-publish.yml
+```yaml
+rest_command: !include rest_command.yaml
 ```
 
-On every push to `main` it:
+Tạo file `rest_command.yaml`:
 
-1. compiles Python files;
-2. runs configuration parser unit tests;
-3. validates `stack.yml` with Docker Compose;
-4. builds the self-contained `linux/amd64` Docker image;
-5. publishes `latest` and an immutable `sha-*` tag to GHCR.
-
-Default image for this repository:
-
-```text
-ghcr.io/khaisilk1910/camera-tts-ezviz:latest
+```yaml
+camera_tts:
+  url: "http://192.168.31.100:8124/say"
+  method: POST
+  headers:
+    X-API-Key: !secret camera_tts_api_key
+  content_type: "application/json"
+  timeout: 5
+  payload: >
+    {
+      "camera": {{ camera | to_json }},
+      "text": {{ message | to_json }}
+    }
 ```
 
-## 9. Optional automatic Portainer redeploy after Git push
+Thay `192.168.31.100` bằng IP máy chạy Docker/Portainer.
 
-If Portainer gives you a stack/service webhook URL, add it in GitHub repository settings as an Actions secret named:
+Khởi động lại Home Assistant sau khi thêm cấu hình.
 
-```text
-PORTAINER_WEBHOOK_URL
+### Bước 3 - gọi từ Automation / Script
+
+```yaml
+action: rest_command.camera_tts
+data:
+  camera: gate
+  message: "Có người đang đứng trước cổng"
 ```
 
-The workflow will POST to it after a successful `main` image build. If the secret is not configured, the workflow simply skips that step.
+Camera khác:
 
-Do not commit the webhook URL into the repository.
-
-## 10. Update the existing GitHub repository with Git CMD
-
-Clone once if you do not already have a local clone:
-
-```bat
-git clone https://github.com/khaisilk1910/camera-tts-ezviz.git
-cd camera-tts-ezviz
+```yaml
+action: rest_command.camera_tts
+data:
+  camera: yard
+  message: "Có chuyển động ngoài sân"
 ```
 
-Update the local repository first:
+Phát ra tất cả camera:
 
-```bat
-git remote set-url origin https://github.com/khaisilk1910/camera-tts-ezviz.git
-git pull --rebase origin main
+```yaml
+action: rest_command.camera_tts
+data:
+  camera: all
+  message: "Đây là thông báo toàn bộ camera"
 ```
 
-Then copy the extracted v2 package files over the repository folder and overwrite the old files. After that run:
+### Điều chỉnh gain ngay từ Home Assistant
 
-```bat
-git add -A
-git status
-git commit -m "Portainer environment stack v2"
-git push origin main
+Nếu muốn truyền âm lượng riêng theo từng lần gọi, thêm REST command thứ hai:
+
+```yaml
+camera_tts_gain:
+  url: "http://192.168.31.100:8124/say"
+  method: POST
+  headers:
+    X-API-Key: !secret camera_tts_api_key
+  content_type: "application/json"
+  timeout: 5
+  payload: >
+    {
+      "camera": {{ camera | to_json }},
+      "text": {{ message | to_json }},
+      "gain_db": {{ gain_db | float }}
+    }
 ```
 
-`git add -A` is important because this version removes the old required `config/cameras.yaml` and Docker-secret workflow.
+Gọi:
 
-After the push, open GitHub -> Actions and verify that **Build and publish Camera TTS image** completes successfully.
+```yaml
+action: rest_command.camera_tts_gain
+data:
+  camera: gate
+  message: "Cảnh báo có người trước cổng"
+  gain_db: 6
+```
 
-## 11. Security notes
+---
 
-- Change `API_KEY`; do not keep `change-me-now`.
-- Camera passwords stored as Portainer environment values are convenient, but users with sufficient Docker/Portainer permissions can inspect container configuration. If you later require stronger secret isolation, the parser still supports password files and the API supports `API_KEY_FILE` for Docker-secret style deployment.
-- Do not expose the API port directly to the public Internet. Keep it on your LAN/VPN and firewall it appropriately.
-- Check the vendor's HCNetSDK redistribution terms before publishing SDK binaries publicly.
+## Cấu hình khuyến nghị
+
+```env
+PORT=8124
+API_KEY=CHANGE_THIS_TO_A_LONG_RANDOM_KEY
+DEFAULT_CAMERA=gate
+TTS_GAIN_DB=4
+TTS_VOICE=vi-VN-HoaiMyNeural
+CAMERAS_JSON={"gate":{"ip":"192.168.31.59","user":"admin","password":"PASS_GATE"},"yard":{"ip":"192.168.31.60","user":"admin","password":"PASS_YARD"}}
+```
+
+Sau khi sửa camera, âm lượng hoặc API key trong Portainer, chỉ cần bấm **Update the stack**.
