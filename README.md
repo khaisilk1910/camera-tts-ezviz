@@ -21,15 +21,15 @@ Docker service phát TTS tiếng Việt ra loa camera EZVIZ/Hikvision qua HCNetS
 Vào **Portainer → Stacks → Add stack → Web editor** và dùng:
 
 ```yaml
-version: "3.8"
-
 services:
   camera-tts:
     image: "ghcr.io/khaisilk1910/camera-tts-ezviz:latest"
     hostname: "camera-tts-ezviz"
 
+    network_mode: host
+
     environment:
-      # Các biến cấu hình từ Portainer
+      # ===== Các biến cần chỉnh trong Portainer =====
       PORT: "${PORT:-8124}"
       API_KEY: "${API_KEY:-change-me-now}"
       DEFAULT_CAMERA: "${DEFAULT_CAMERA:-}"
@@ -37,60 +37,50 @@ services:
       TTS_VOICE: "${TTS_VOICE:-vi-VN-HoaiMyNeural}"
       CAMERAS_JSON: "${CAMERAS_JSON:-}"
 
-      # Cấu hình chung
+      # ===== Cấu hình mặc định =====
       TZ: "Asia/Ho_Chi_Minh"
       ALLOW_NO_AUTH: "false"
+
       TTS_RATE: "+0%"
       TTS_EDGE_VOLUME: "+0%"
       TTS_SAMPLE_RATE: "16000"
       TTS_BITRATE: "32k"
+
       QUEUE_SIZE: "30"
       MAX_TEXT: "700"
+
       PREP_WORKERS: "4"
       HTTP_THREADS: "8"
+
       SEND_TIMEOUT: "180"
       PREP_TIMEOUT: "300"
       TTS_TIMEOUT: "120"
+
       JOB_HISTORY: "500"
+
       CACHE_DIR: "/cache"
       CACHE_MAX_MB: "512"
       CACHE_TTL_DAYS: "30"
+
       CAMERA_DEFAULT_PORT: "8000"
       CAMERA_DEFAULT_VOICE_CHAN: "1"
+
       CAMERA_CONNECT_TIMEOUT_MS: "3000"
       CAMERA_RECONNECT_INTERVAL_MS: "10000"
+
       ALLOW_REQUEST_OVERRIDES: "true"
       ALLOW_DUPLICATE_CAMERA_TARGETS: "false"
+
+    restart: unless-stopped
 
     volumes:
       - camera_tts_cache:/cache
 
-    networks:
-      - host
-
     stop_grace_period: 15s
-
-    deploy:
-      mode: replicated
-      replicas: 1
-      restart_policy:
-        condition: on-failure
-        delay: 3s
-        max_attempts: 10
-        window: 60s
-      update_config:
-        parallelism: 1
-        order: stop-first
-        failure_action: rollback
-        monitor: 20s
 
 volumes:
   camera_tts_cache:
     name: "camera-tts-ezviz-cache"
-
-networks:
-  host:
-    external: true
 ```
 
 Sau đó khai báo các biến trong **Environment variables** của Stack.
