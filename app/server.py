@@ -21,7 +21,7 @@ from waitress import serve
 from config import ConfigError, load_cameras, load_settings, parse_float, public_settings, validate_percent
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2.3.1")
+APP_VERSION = os.environ.get("APP_VERSION", "2.3.3")
 app = Flask(__name__)
 
 SETTINGS = load_settings()
@@ -41,6 +41,7 @@ PRECACHE_TEXTS_JSON = os.environ.get("PRECACHE_TEXTS_JSON", "").strip()
 MEDIA_PREP_TIMEOUT = max(30, min(int(os.environ.get("MEDIA_PREP_TIMEOUT", "900")), 7200))
 MEDIA_SEND_TIMEOUT = max(60, min(int(os.environ.get("MEDIA_SEND_TIMEOUT", "7200")), 21600))
 MEDIA_MAX_URL_LENGTH = max(256, min(int(os.environ.get("MEDIA_MAX_URL_LENGTH", "4096")), 16384))
+LOG_SUCCESSFUL_JOBS = os.environ.get("LOG_SUCCESSFUL_JOBS", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_ERROR = ""
 try:
@@ -72,7 +73,10 @@ base_locks = [threading.Lock() for _ in range(64)]
 aac_locks = [threading.Lock() for _ in range(64)]
 enqueue_lock = threading.Lock()
 cache_lock = threading.Lock()
-flight_lock = threading.Lock()
+# RLock is intentional: Future.add_done_callback() may execute synchronously
+# when a very fast cache-hit future is already complete. A plain Lock here can
+# deadlock the HTTP request while registering the callback.
+flight_lock = threading.RLock()
 inflight_audio: dict[str, Future] = {}
 
 cache_stats_lock = threading.Lock()
@@ -401,24 +405,35 @@ def prepare_audio(spec: dict[str, Any]) -> dict[str, Any]:
                 pass
 
 
-def get_prepare_future(spec: dict[str, Any]) -> Future:
-    _, aac_key = audio_keys(spec)
+def _submit_singleflight(key: str, prepare_fn, spec: dict[str, Any]) -> Future:
+    """Submit one preparation job per cache key without blocking HTTP threads.
+
+    add_done_callback() is deliberately called after the critical section.
+    Python may invoke callbacks immediately when a Future is already finished
+    (common on cache hits). Keeping callback registration outside the lock avoids
+    the request-thread deadlock that previously surfaced in Home Assistant as
+    "Timeout on reading data from socket".
+    """
     with flight_lock:
-        existing = inflight_audio.get(aac_key)
+        existing = inflight_audio.get(key)
         if existing is not None and not existing.done():
             stat_inc("singleflight_joins")
             return existing
+        future = prep_pool.submit(prepare_fn, spec)
+        inflight_audio[key] = future
 
-        future = prep_pool.submit(prepare_audio, spec)
-        inflight_audio[aac_key] = future
+    def clear_flight(done_future: Future, flight_key: str = key) -> None:
+        with flight_lock:
+            if inflight_audio.get(flight_key) is done_future:
+                inflight_audio.pop(flight_key, None)
 
-        def clear_flight(done_future: Future, key: str = aac_key) -> None:
-            with flight_lock:
-                if inflight_audio.get(key) is done_future:
-                    inflight_audio.pop(key, None)
+    future.add_done_callback(clear_flight)
+    return future
 
-        future.add_done_callback(clear_flight)
-        return future
+
+def get_prepare_future(spec: dict[str, Any]) -> Future:
+    _, aac_key = audio_keys(spec)
+    return _submit_singleflight(aac_key, prepare_audio, spec)
 
 
 def media_spec(camera_cfg: dict[str, Any], media_url: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -538,22 +553,7 @@ def prepare_media(spec: dict[str, Any]) -> dict[str, Any]:
 
 def get_media_future(spec: dict[str, Any]) -> Future:
     key = "media:" + media_key(spec)
-    with flight_lock:
-        existing = inflight_audio.get(key)
-        if existing is not None and not existing.done():
-            stat_inc("singleflight_joins")
-            return existing
-
-        future = prep_pool.submit(prepare_media, spec)
-        inflight_audio[key] = future
-
-        def clear_flight(done_future: Future, flight_key: str = key) -> None:
-            with flight_lock:
-                if inflight_audio.get(flight_key) is done_future:
-                    inflight_audio.pop(flight_key, None)
-
-        future.add_done_callback(clear_flight)
-        return future
+    return _submit_singleflight(key, prepare_media, spec)
 
 
 class PlaybackStopped(RuntimeError):
@@ -830,11 +830,15 @@ class CameraWorker:
         while True:
             item = self.queue.get()
             job_id = item["job_id"]
+            kind = str(item.get("kind") or "unknown")
+            stage = "prepare"
             self.current_job = job_id
             try:
                 update_job(job_id, status="preparing")
                 mark_job_stage(job_id, "prepare_wait_start_ms")
-                prepared = item["future"].result(timeout=SETTINGS.prep_timeout)
+                prepared = item["future"].result(
+                    timeout=float(item.get("prep_timeout") or SETTINGS.prep_timeout)
+                )
                 if self._is_cancelled(job_id):
                     raise PlaybackStopped("playback stopped")
                 mark_job_stage(job_id, "audio_ready_ms")
@@ -845,26 +849,41 @@ class CameraWorker:
                     prepare_ms=prepared.get("prepare_ms"),
                     status="playing",
                 )
-                log(
-                    f"[{job_id}] camera={self.camera_id} PLAY "
-                    f"cache={prepared.get('cache')} prepare_ms={prepared.get('prepare_ms')}"
-                )
+                if LOG_SUCCESSFUL_JOBS:
+                    log(
+                        f"[{job_id}] camera={self.camera_id} kind={kind} stage=play "
+                        f"cache={prepared.get('cache')} prepare_ms={prepared.get('prepare_ms')}"
+                    )
+                stage = "hcnetsdk_playback"
                 mark_job_stage(job_id, "play_start_ms")
                 play_result = self.sender.play(prepared["path"], timeout=item.get("send_timeout"))
                 mark_job_stage(job_id, "done_ms")
                 update_job(job_id, status="done", playback=play_result)
-                log(
-                    f"[{job_id}] camera={self.camera_id} DONE "
-                    f"sdk_ms={play_result.get('sdk_ms')} sender_ms={play_result.get('sender_ms')}"
-                )
+                if LOG_SUCCESSFUL_JOBS:
+                    log(
+                        f"[{job_id}] camera={self.camera_id} kind={kind} stage=done "
+                        f"sdk_ms={play_result.get('sdk_ms')} sender_ms={play_result.get('sender_ms')}"
+                    )
             except PlaybackStopped:
                 mark_job_stage(job_id, "stopped_ms")
-                update_job(job_id, status="stopped")
-                log(f"[{job_id}] camera={self.camera_id} STOPPED")
+                update_job(job_id, status="stopped", error_stage=stage)
+                if LOG_SUCCESSFUL_JOBS:
+                    log(f"[{job_id}] camera={self.camera_id} kind={kind} stage={stage} STOPPED")
             except Exception as exc:
                 mark_job_stage(job_id, "error_ms")
-                update_job(job_id, status="error", error=str(exc))
-                log(f"[{job_id}] camera={self.camera_id} ERROR: {exc}")
+                error_type = exc.__class__.__name__
+                error_text = str(exc) or error_type
+                update_job(
+                    job_id,
+                    status="error",
+                    error=error_text,
+                    error_type=error_type,
+                    error_stage=stage,
+                )
+                log(
+                    f"ERROR job={job_id} camera={self.camera_id} kind={kind} "
+                    f"stage={stage} type={error_type} detail={error_text}"
+                )
             finally:
                 self._clear_cancelled(job_id)
                 self.current_job = None
@@ -937,7 +956,7 @@ def enqueue_request(camera_value: Any, data: dict[str, Any]) -> list[dict[str, A
                 future = get_prepare_future(spec)
                 per_request_futures[aac_key] = future
             job = new_job(camera_id, text)
-            worker.enqueue({"job_id": job["id"], "future": future, "kind": "tts", "send_timeout": SETTINGS.send_timeout})
+            worker.enqueue({"job_id": job["id"], "future": future, "kind": "tts", "prep_timeout": SETTINGS.prep_timeout, "send_timeout": SETTINGS.send_timeout})
             staged.append((worker, job, future))
 
     snapshots = []
@@ -962,11 +981,14 @@ def enqueue_media_request(camera_value: Any, data: dict[str, Any]) -> list[dict[
     staged: list[tuple[CameraWorker, dict[str, Any], Future]] = []
     per_request_futures: dict[str, Future] = {}
 
-    with enqueue_lock:
-        if replace:
-            for camera_id in targets:
-                WORKERS[camera_id].stop(clear_queue=True)
+    # Stopping a camera can take up to ~1s while the HCNetSDK worker exits.
+    # Do this outside the global enqueue lock so one camera cannot stall API
+    # requests for every other camera.
+    if replace:
+        for camera_id in targets:
+            WORKERS[camera_id].stop(clear_queue=True)
 
+    with enqueue_lock:
         for camera_id in targets:
             if WORKERS[camera_id].queue.full():
                 raise OverflowError(f"queue full for camera: {camera_id}")
@@ -985,6 +1007,7 @@ def enqueue_media_request(camera_value: Any, data: dict[str, Any]) -> list[dict[
                 "job_id": job["id"],
                 "future": future,
                 "kind": "media",
+                "prep_timeout": MEDIA_PREP_TIMEOUT,
                 "send_timeout": MEDIA_SEND_TIMEOUT,
             })
             staged.append((worker, job, future))

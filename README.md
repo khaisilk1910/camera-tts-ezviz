@@ -1,4 +1,4 @@
-# Camera TTS EZVIZ Docker v2.3.1
+# Camera TTS EZVIZ Docker v2.3.3
 
 Docker backend phát TTS và audio/nhạc ra loa camera EZVIZ/Hikvision qua HCNetSDK.
 
@@ -48,6 +48,7 @@ services:
       MAX_TEXT: "700"
       PREP_WORKERS: "4"
       HTTP_THREADS: "8"
+      LOG_SUCCESSFUL_JOBS: "false"
       SEND_TIMEOUT: "180"
       PREP_TIMEOUT: "300"
       TTS_TIMEOUT: "120"
@@ -64,7 +65,7 @@ services:
 
       VOICE_START_DELAY_MS: "120"
       VOICE_END_DELAY_MS: "80"
-      SENDER_START_TIMEOUT: "120"
+      SENDER_START_TIMEOUT: "8"
 
       MEDIA_PREP_TIMEOUT: "900"
       MEDIA_SEND_TIMEOUT: "7200"
@@ -171,3 +172,17 @@ curl -H "X-API-Key: YOUR_API_KEY" http://192.168.31.100:8124/cache/stats
 Cài repository HACS riêng `https://github.com/khaisilk1910/camera_tts_ezviz_hacs`. Integration sẽ đọc `/cameras` và tự tạo một `media_player` cho từng camera.
 
 REST API `/say` vẫn được giữ để các automation cũ tiếp tục chạy.
+
+
+## Sửa lỗi v2.3.3
+
+- Sửa race/deadlock ở single-flight cache: khi tác vụ chuẩn bị audio hoàn thành ngay (thường là cache hit), callback của `Future` không còn có thể giữ treo request HTTP `/say` hoặc `/media`.
+- Tách thao tác stop HCNetSDK ra khỏi global enqueue lock để một camera đang dừng không làm chậm request của camera khác.
+- Media worker dùng đúng `MEDIA_PREP_TIMEOUT`; trước đây có thể bị cắt sớm bởi `PREP_TIMEOUT`.
+- Mặc định `LOG_SUCCESSFUL_JOBS=false`: Docker chỉ giữ log khởi động/cảnh báo/lỗi chính, tránh spam log khi phát thành công. Lỗi job ghi rõ `job`, `camera`, `kind`, `stage`, `type`, `detail`.
+
+Nếu cần log cả job thành công để benchmark, đặt:
+
+```env
+LOG_SUCCESSFUL_JOBS=true
+```

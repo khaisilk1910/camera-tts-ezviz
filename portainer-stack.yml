@@ -25,6 +25,7 @@ services:
       MAX_TEXT: "700"
       PREP_WORKERS: "4"
       HTTP_THREADS: "8"
+      LOG_SUCCESSFUL_JOBS: "false"
       SEND_TIMEOUT: "180"
       PREP_TIMEOUT: "300"
       TTS_TIMEOUT: "120"
@@ -47,6 +48,7 @@ services:
       # Phát file/URL nhạc qua media_player Home Assistant.
       MEDIA_PREP_TIMEOUT: "900"
       MEDIA_SEND_TIMEOUT: "7200"
+      MEDIA_MAX_URL_LENGTH: "4096"
 
       ALLOW_REQUEST_OVERRIDES: "true"
       ALLOW_DUPLICATE_CAMERA_TARGETS: "false"
