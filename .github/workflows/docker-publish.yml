@@ -21,7 +21,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Validate Python configuration parser
+      - name: Validate Python and unit tests
         run: |
           python3 -m py_compile app/config.py app/server.py
           python3 -m unittest discover -s tests -v
@@ -64,7 +64,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            APP_VERSION=${{ github.sha }}
+            APP_VERSION=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: mode=max

@@ -44,6 +44,10 @@ services:
       VOICE_END_DELAY_MS: "80"
       SENDER_START_TIMEOUT: "8"
 
+      # Phát file/URL nhạc qua media_player Home Assistant.
+      MEDIA_PREP_TIMEOUT: "900"
+      MEDIA_SEND_TIMEOUT: "7200"
+
       ALLOW_REQUEST_OVERRIDES: "true"
       ALLOW_DUPLICATE_CAMERA_TARGETS: "false"
 

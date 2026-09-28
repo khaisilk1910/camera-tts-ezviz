@@ -22,7 +22,7 @@ RUN test -f /opt/hcnetsdk/incEn/HCNetSDK.h \
 
 FROM ubuntu:22.04
 
-ARG APP_VERSION=2.2.0
+ARG APP_VERSION=2.3.1
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
