@@ -43,6 +43,8 @@ services:
       # Giảm thời gian mở/đóng VoiceTalk nhưng vẫn giữ biên an toàn.
       VOICE_START_DELAY_MS: "120"
       VOICE_END_DELAY_MS: "80"
+      # Tránh lỗi HCNetSDK khi câu sau mở kênh ngay sau câu trước.
+      VOICE_REOPEN_GUARD_MS: "1250"
       SENDER_START_TIMEOUT: "8"
 
       # Phát file/URL nhạc qua media_player Home Assistant.

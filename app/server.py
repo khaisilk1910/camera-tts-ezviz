@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -19,9 +20,10 @@ from flask import Flask, jsonify, request
 from waitress import serve
 
 from config import ConfigError, load_cameras, load_settings, parse_float, public_settings, validate_percent
+from queueing import PlaybackQueue, normalize_queue_mode
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2.3.3")
+APP_VERSION = os.environ.get("APP_VERSION", "2.4.0")
 app = Flask(__name__)
 
 SETTINGS = load_settings()
@@ -34,9 +36,32 @@ AAC_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 MEDIA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
 
+RUNTIME_SETTINGS_FILE = CACHE_DIR / "runtime-settings.json"
+runtime_settings_lock = threading.Lock()
+
+
+def _load_runtime_settings() -> dict[str, dict[str, Any]]:
+    try:
+        raw = json.loads(RUNTIME_SETTINGS_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), f"runtime settings ignored: {exc}", flush=True)
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+
+
+def _save_runtime_settings(settings: dict[str, dict[str, Any]]) -> None:
+    tmp = RUNTIME_SETTINGS_FILE.with_name(f".{RUNTIME_SETTINGS_FILE.name}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(json.dumps(settings, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
+    os.replace(tmp, RUNTIME_SETTINGS_FILE)
+
 SENDER_START_TIMEOUT = max(1.0, float(os.environ.get("SENDER_START_TIMEOUT", "8")))
 VOICE_START_DELAY_MS = max(0, min(int(os.environ.get("VOICE_START_DELAY_MS", "120")), 2000))
 VOICE_END_DELAY_MS = max(0, min(int(os.environ.get("VOICE_END_DELAY_MS", "80")), 2000))
+VOICE_REOPEN_GUARD_MS = max(0, min(int(os.environ.get("VOICE_REOPEN_GUARD_MS", "1250")), 5000))
 PRECACHE_TEXTS_JSON = os.environ.get("PRECACHE_TEXTS_JSON", "").strip()
 MEDIA_PREP_TIMEOUT = max(30, min(int(os.environ.get("MEDIA_PREP_TIMEOUT", "900")), 7200))
 MEDIA_SEND_TIMEOUT = max(60, min(int(os.environ.get("MEDIA_SEND_TIMEOUT", "7200")), 21600))
@@ -49,6 +74,20 @@ try:
 except ConfigError as exc:
     CAMERAS, DEFAULT_CAMERA = {}, ""
     CONFIG_ERROR = str(exc)
+
+BASE_CAMERA_GAINS = {camera_id: float(cfg["gain_db"]) for camera_id, cfg in CAMERAS.items()}
+RUNTIME_SETTINGS = _load_runtime_settings()
+for _camera_id, _overrides in list(RUNTIME_SETTINGS.items()):
+    if _camera_id not in CAMERAS:
+        continue
+    try:
+        if "gain_db" in _overrides:
+            CAMERAS[_camera_id]["gain_db"] = parse_float(
+                _overrides["gain_db"], f"runtime gain_db for {_camera_id}",
+                float(CAMERAS[_camera_id]["gain_db"]), -20.0, 12.0
+            )
+    except ConfigError:
+        RUNTIME_SETTINGS.pop(_camera_id, None)
 
 
 def log(message: str) -> None:
@@ -71,7 +110,6 @@ job_order: list[str] = []
 prep_pool = ThreadPoolExecutor(max_workers=SETTINGS.prep_workers, thread_name_prefix="tts-prep")
 base_locks = [threading.Lock() for _ in range(64)]
 aac_locks = [threading.Lock() for _ in range(64)]
-enqueue_lock = threading.Lock()
 cache_lock = threading.Lock()
 # RLock is intentional: Future.add_done_callback() may execute synchronously
 # when a very fast cache-hit future is already complete. A plain Lock here can
@@ -569,6 +607,8 @@ class PersistentCameraSender:
         self.command_lock = threading.Lock()
         self.last_error: str | None = None
         self.last_ready_at: float | None = None
+        self.last_user_id: int | None = None
+        self.last_forced_stop_at: float | None = None
         self.stop_requested = threading.Event()
         threading.Thread(target=self._warm_start, daemon=True, name=f"sdk-warm-{camera_id}").start()
 
@@ -587,6 +627,7 @@ class PersistentCameraSender:
                 "CAMERA_RECONNECT_INTERVAL_MS": os.environ.get("CAMERA_RECONNECT_INTERVAL_MS", "10000"),
                 "VOICE_START_DELAY_MS": str(VOICE_START_DELAY_MS),
                 "VOICE_END_DELAY_MS": str(VOICE_END_DELAY_MS),
+                "VOICE_REOPEN_GUARD_MS": str(VOICE_REOPEN_GUARD_MS),
                 "LD_LIBRARY_PATH": (
                     f"{SETTINGS.hcnetsdk_root}/lib:{SETTINGS.hcnetsdk_root}/lib/HCNetSDKCom:"
                     + env.get("LD_LIBRARY_PATH", "")
@@ -694,15 +735,28 @@ class PersistentCameraSender:
             self._stop_process()
             raise RuntimeError(f"HCNetSDK worker startup failed: {line}")
 
+        parts = line.split("\t", 1)
+        try:
+            self.last_user_id = int(parts[1]) if len(parts) > 1 else None
+        except ValueError:
+            self.last_user_id = None
         self.last_error = None
         self.last_ready_at = time.time()
         log(f"[{self.camera_id}] persistent HCNetSDK worker ready ({line})")
 
+    def _wait_after_forced_stop(self) -> None:
+        if self.last_forced_stop_at is None or VOICE_REOPEN_GUARD_MS <= 0:
+            return
+        remaining = (VOICE_REOPEN_GUARD_MS / 1000.0) - (time.monotonic() - self.last_forced_stop_at)
+        if remaining > 0:
+            time.sleep(remaining)
+        self.last_forced_stop_at = None
+
     def play(self, aac_file: str, timeout: float | None = None) -> dict[str, Any]:
         started = time.monotonic()
         play_timeout = float(timeout or SETTINGS.send_timeout)
-        self.stop_requested.clear()
         with self.command_lock:
+            self._wait_after_forced_stop()
             for attempt in range(2):
                 if self.stop_requested.is_set():
                     raise PlaybackStopped("playback stopped")
@@ -745,6 +799,11 @@ class PersistentCameraSender:
                     parts = line.split("\t")
                     frames = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
                     sdk_ms = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+                    if len(parts) > 3:
+                        try:
+                            self.last_user_id = int(parts[3])
+                        except ValueError:
+                            pass
                     self.last_error = None
                     return {
                         "frames": frames,
@@ -764,6 +823,7 @@ class PersistentCameraSender:
         self.stop_requested.set()
         proc = self.proc
         self.proc = None
+        self.last_user_id = None
         if proc is not None and proc.poll() is None:
             try:
                 proc.terminate()
@@ -773,14 +833,18 @@ class PersistentCameraSender:
                     proc.kill()
                 except Exception:
                     pass
+            finally:
+                self.last_forced_stop_at = time.monotonic()
 
     def status(self) -> dict[str, Any]:
         proc = self.proc
+        alive = bool(proc is not None and proc.poll() is None)
         return {
-            "alive": bool(proc is not None and proc.poll() is None),
-            "pid": proc.pid if proc is not None and proc.poll() is None else None,
+            "alive": alive,
+            "pid": proc.pid if alive else None,
             "last_error": self.last_error,
             "ready_at": self.last_ready_at,
+            "connected": alive and self.last_user_id is not None and self.last_user_id >= 0,
         }
 
 
@@ -788,33 +852,37 @@ class CameraWorker:
     def __init__(self, camera_id: str, cfg: dict[str, Any]):
         self.camera_id = camera_id
         self.cfg = cfg
-        self.queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=int(cfg.get("queue_size", SETTINGS.queue_size)))
+        self.queue = PlaybackQueue(maxsize=int(cfg.get("queue_size", SETTINGS.queue_size)))
         self.current_job: str | None = None
         self.cancelled_jobs: set[str] = set()
         self.cancel_lock = threading.Lock()
+        # Serialize stop/queue-mode/enqueue operations per camera. This avoids
+        # REPLACE/PLAY races without blocking unrelated cameras.
+        self.action_lock = threading.Lock()
         self.sender = PersistentCameraSender(camera_id, cfg)
         self.thread = threading.Thread(target=self.run, daemon=True, name=f"camera-{camera_id}")
         self.thread.start()
 
-    def enqueue(self, item: dict[str, Any]) -> None:
-        self.queue.put_nowait(item)
+    def enqueue(self, item: dict[str, Any], *, next_item: bool = False) -> None:
+        self.queue.put_nowait(item, next_item=next_item)
 
     def stop(self, clear_queue: bool = True) -> int:
         stopped = 0
         if clear_queue:
-            while True:
-                try:
-                    item = self.queue.get_nowait()
-                except queue.Empty:
-                    break
+            for item in self.queue.clear():
                 update_job(item["job_id"], status="stopped")
-                self.queue.task_done()
                 stopped += 1
         if self.current_job:
+            current_job = self.current_job
+            current = job_snapshot(current_job) or {}
             with self.cancel_lock:
-                self.cancelled_jobs.add(self.current_job)
-            update_job(self.current_job, status="stopping")
-            self.sender.stop_current()
+                self.cancelled_jobs.add(current_job)
+            update_job(current_job, status="stopping")
+            # Do not restart an idle persistent HCNetSDK worker just because a
+            # preparation-stage item was cancelled. Once status is playing, the
+            # sender may already own VoiceTalk and must be terminated promptly.
+            if current.get("status") == "playing":
+                self.sender.stop_current()
             stopped += 1
         return stopped
 
@@ -826,39 +894,62 @@ class CameraWorker:
         with self.cancel_lock:
             self.cancelled_jobs.discard(job_id)
 
+    def _finish_current(self, job_id: str, **fields: Any) -> None:
+        """Publish a terminal job state and clear current_job atomically."""
+        with self.action_lock:
+            update_job(job_id, **fields)
+            if self.current_job == job_id:
+                self.current_job = None
+
     def run(self) -> None:
         while True:
-            item = self.queue.get()
-            job_id = item["job_id"]
-            kind = str(item.get("kind") or "unknown")
-            stage = "prepare"
-            self.current_job = job_id
-            try:
+            # Wait without holding action_lock, then atomically dequeue and mark
+            # the job current. This closes the tiny REPLACE race between a queue
+            # pop and current_job becoming visible to stop().
+            self.queue.wait_for_item()
+            with self.action_lock:
+                try:
+                    item = self.queue.get_nowait()
+                except queue.Empty:
+                    continue
+                job_id = item["job_id"]
+                kind = str(item.get("kind") or "unknown")
+                stage = "prepare"
+                self.current_job = job_id
+                # Clear a stop from the previous job only while this new job is
+                # protected by action_lock. A later stop must remain observable.
+                self.sender.stop_requested.clear()
                 update_job(job_id, status="preparing")
                 mark_job_stage(job_id, "prepare_wait_start_ms")
+            try:
                 prepared = item["future"].result(
                     timeout=float(item.get("prep_timeout") or SETTINGS.prep_timeout)
                 )
-                if self._is_cancelled(job_id):
-                    raise PlaybackStopped("playback stopped")
                 mark_job_stage(job_id, "audio_ready_ms")
-                update_job(
-                    job_id,
-                    cache=prepared.get("cache"),
-                    base_cache=prepared.get("base_cache"),
-                    prepare_ms=prepared.get("prepare_ms"),
-                    status="playing",
-                )
+                # Serialize the final cancellation check with stop(). Once this
+                # block publishes status=playing, a concurrent stop knows it
+                # must terminate the HCNetSDK sender; before that it only needs
+                # to cancel preparation.
+                with self.action_lock:
+                    if self._is_cancelled(job_id):
+                        raise PlaybackStopped("playback stopped")
+                    update_job(
+                        job_id,
+                        cache=prepared.get("cache"),
+                        base_cache=prepared.get("base_cache"),
+                        prepare_ms=prepared.get("prepare_ms"),
+                        status="playing",
+                    )
+                    stage = "hcnetsdk_playback"
+                    mark_job_stage(job_id, "play_start_ms")
                 if LOG_SUCCESSFUL_JOBS:
                     log(
                         f"[{job_id}] camera={self.camera_id} kind={kind} stage=play "
                         f"cache={prepared.get('cache')} prepare_ms={prepared.get('prepare_ms')}"
                     )
-                stage = "hcnetsdk_playback"
-                mark_job_stage(job_id, "play_start_ms")
                 play_result = self.sender.play(prepared["path"], timeout=item.get("send_timeout"))
                 mark_job_stage(job_id, "done_ms")
-                update_job(job_id, status="done", playback=play_result)
+                self._finish_current(job_id, status="done", playback=play_result)
                 if LOG_SUCCESSFUL_JOBS:
                     log(
                         f"[{job_id}] camera={self.camera_id} kind={kind} stage=done "
@@ -866,14 +957,14 @@ class CameraWorker:
                     )
             except PlaybackStopped:
                 mark_job_stage(job_id, "stopped_ms")
-                update_job(job_id, status="stopped", error_stage=stage)
+                self._finish_current(job_id, status="stopped", error_stage=stage)
                 if LOG_SUCCESSFUL_JOBS:
                     log(f"[{job_id}] camera={self.camera_id} kind={kind} stage={stage} STOPPED")
             except Exception as exc:
                 mark_job_stage(job_id, "error_ms")
                 error_type = exc.__class__.__name__
                 error_text = str(exc) or error_type
-                update_job(
+                self._finish_current(
                     job_id,
                     status="error",
                     error=error_text,
@@ -886,8 +977,12 @@ class CameraWorker:
                 )
             finally:
                 self._clear_cancelled(job_id)
-                self.current_job = None
-                self.queue.task_done()
+                # Terminal paths normally clear current_job via _finish_current.
+                # Keep this guarded fallback for unexpected exceptions while
+                # formatting/logging a terminal result.
+                with self.action_lock:
+                    if self.current_job == job_id:
+                        self.current_job = None
 
 
 WORKERS = {camera_id: CameraWorker(camera_id, cfg) for camera_id, cfg in CAMERAS.items()}
@@ -926,6 +1021,29 @@ def parse_targets(value: Any) -> list[str]:
     return list(dict.fromkeys(targets))
 
 
+
+@contextmanager
+def camera_action_scope(targets: list[str]):
+    """Serialize queue-mode actions for target cameras without a global lock.
+
+    Locks are acquired in stable camera-id order so multi-camera requests cannot
+    deadlock each other. Unrelated cameras remain fully concurrent.
+    """
+    with ExitStack() as stack:
+        for camera_id in sorted(set(targets)):
+            stack.enter_context(WORKERS[camera_id].action_lock)
+        yield
+
+
+def _prepare_queue_mode(targets: list[str], mode: str) -> None:
+    if mode == "replace":
+        for camera_id in targets:
+            WORKERS[camera_id].stop(clear_queue=True)
+    elif mode == "play":
+        for camera_id in targets:
+            WORKERS[camera_id].stop(clear_queue=False)
+
+
 def enqueue_request(camera_value: Any, data: dict[str, Any]) -> list[dict[str, Any]]:
     text = normalize_text(str(data.get("text", data.get("message", ""))))
     if not text:
@@ -937,11 +1055,15 @@ def enqueue_request(camera_value: Any, data: dict[str, Any]) -> list[dict[str, A
     unknown = [camera_id for camera_id in targets if camera_id not in CAMERAS]
     if unknown:
         raise ValueError(f"unknown camera(s): {', '.join(unknown)}")
+    queue_mode = normalize_queue_mode(data, default="add")
 
     staged: list[tuple[CameraWorker, dict[str, Any], Future]] = []
     per_request_futures: dict[str, Future] = {}
 
-    with enqueue_lock:
+    # Keep stop + queue mutation atomic for each target camera. A slow SDK stop
+    # therefore never serializes requests destined for a different camera.
+    with camera_action_scope(targets):
+        _prepare_queue_mode(targets, queue_mode)
         for camera_id in targets:
             if WORKERS[camera_id].queue.full():
                 raise OverflowError(f"queue full for camera: {camera_id}")
@@ -956,7 +1078,7 @@ def enqueue_request(camera_value: Any, data: dict[str, Any]) -> list[dict[str, A
                 future = get_prepare_future(spec)
                 per_request_futures[aac_key] = future
             job = new_job(camera_id, text)
-            worker.enqueue({"job_id": job["id"], "future": future, "kind": "tts", "prep_timeout": SETTINGS.prep_timeout, "send_timeout": SETTINGS.send_timeout})
+            worker.enqueue({"job_id": job["id"], "future": future, "kind": "tts", "prep_timeout": SETTINGS.prep_timeout, "send_timeout": SETTINGS.send_timeout}, next_item=queue_mode in {"next", "play", "replace"})
             staged.append((worker, job, future))
 
     snapshots = []
@@ -977,18 +1099,14 @@ def enqueue_media_request(camera_value: Any, data: dict[str, Any]) -> list[dict[
     if unknown:
         raise ValueError(f"unknown camera(s): {', '.join(unknown)}")
 
-    replace = bool(data.get("replace", True))
+    queue_mode = normalize_queue_mode(data, default="replace")
     staged: list[tuple[CameraWorker, dict[str, Any], Future]] = []
     per_request_futures: dict[str, Future] = {}
 
-    # Stopping a camera can take up to ~1s while the HCNetSDK worker exits.
-    # Do this outside the global enqueue lock so one camera cannot stall API
-    # requests for every other camera.
-    if replace:
-        for camera_id in targets:
-            WORKERS[camera_id].stop(clear_queue=True)
-
-    with enqueue_lock:
+    # Same per-camera transaction semantics as TTS: queue-mode + enqueue are
+    # serialized only for the cameras touched by this request.
+    with camera_action_scope(targets):
+        _prepare_queue_mode(targets, queue_mode)
         for camera_id in targets:
             if WORKERS[camera_id].queue.full():
                 raise OverflowError(f"queue full for camera: {camera_id}")
@@ -1009,7 +1127,7 @@ def enqueue_media_request(camera_value: Any, data: dict[str, Any]) -> list[dict[
                 "kind": "media",
                 "prep_timeout": MEDIA_PREP_TIMEOUT,
                 "send_timeout": MEDIA_SEND_TIMEOUT,
-            })
+            }, next_item=queue_mode in {"next", "play", "replace"})
             staged.append((worker, job, future))
 
     snapshots = []
@@ -1070,8 +1188,8 @@ def root():
             "service": "camera-tts-ezviz",
             "version": APP_VERSION,
             "status": "ready" if CAMERAS and not CONFIG_ERROR else "needs-configuration",
-            "optimizations": ["persistent-hcnetsdk-login", "two-level-cache", "singleflight", "parallel-prepare", "media-player"],
-            "endpoints": ["/health", "/cameras", "/cache/stats", "/config", "/say", "/say/<camera_id>", "/media", "/media/<camera_id>", "/stop/<camera_id>", "/jobs/<job_id>"],
+            "optimizations": ["persistent-hcnetsdk-login", "voice-reopen-guard", "priority-queue", "two-level-cache", "singleflight", "parallel-prepare", "runtime-gain", "media-player"],
+            "endpoints": ["/health", "/cameras", "/cameras/<camera_id>/settings", "/cache/stats", "/config", "/say", "/say/<camera_id>", "/media", "/media/<camera_id>", "/stop/<camera_id>", "/jobs/<job_id>"],
         }
     )
 
@@ -1126,6 +1244,7 @@ def config_view():
             "config_error": CONFIG_ERROR or None,
             "voice_start_delay_ms": VOICE_START_DELAY_MS,
             "voice_end_delay_ms": VOICE_END_DELAY_MS,
+            "voice_reopen_guard_ms": VOICE_REOPEN_GUARD_MS,
         }
     )
 
@@ -1153,6 +1272,7 @@ def cameras_view():
                 "voice_chan": cfg["voice_chan"],
                 "voice": cfg["voice"],
                 "gain_db": cfg["gain_db"],
+                "queue_size": int(cfg.get("queue_size", SETTINGS.queue_size)),
                 "sample_rate": cfg["sample_rate"],
                 "bitrate": cfg["bitrate"],
                 "state": media_state,
@@ -1163,7 +1283,58 @@ def cameras_view():
                 "sender": worker.sender.status(),
             }
         )
-    return jsonify({"cameras": result})
+    return jsonify({"version": APP_VERSION, "features": ["queue_modes", "runtime_gain", "voice_reopen_guard"], "cameras": result})
+
+
+@app.patch("/cameras/<camera_id>/settings")
+def camera_settings(camera_id: str):
+    if not require_auth():
+        return auth_error()
+    if camera_id not in CAMERAS:
+        return jsonify({"error": f"unknown camera: {camera_id}"}), 404
+    data = request.get_json(silent=True) or {}
+    allowed = {"gain_db"}
+    unknown = sorted(set(data) - allowed)
+    if unknown:
+        return jsonify({"error": f"unsupported setting(s): {', '.join(unknown)}"}), 400
+    if "gain_db" not in data:
+        return jsonify({"error": "no supported setting supplied"}), 400
+    raw_gain = data.get("gain_db")
+    reset = raw_gain is None or (isinstance(raw_gain, str) and raw_gain.strip().lower() in {"default", "reset"})
+    try:
+        gain_db = (
+            float(BASE_CAMERA_GAINS[camera_id])
+            if reset
+            else parse_float(raw_gain, "gain_db", float(CAMERAS[camera_id]["gain_db"]), -20.0, 12.0)
+        )
+    except ConfigError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    with runtime_settings_lock:
+        previous_gain = float(CAMERAS[camera_id]["gain_db"])
+        previous_runtime = dict(RUNTIME_SETTINGS.get(camera_id) or {})
+        CAMERAS[camera_id]["gain_db"] = gain_db
+        if reset:
+            camera_runtime = dict(previous_runtime)
+            camera_runtime.pop("gain_db", None)
+            if camera_runtime:
+                RUNTIME_SETTINGS[camera_id] = camera_runtime
+            else:
+                RUNTIME_SETTINGS.pop(camera_id, None)
+        else:
+            camera_runtime = dict(previous_runtime)
+            camera_runtime["gain_db"] = gain_db
+            RUNTIME_SETTINGS[camera_id] = camera_runtime
+        try:
+            _save_runtime_settings(RUNTIME_SETTINGS)
+        except OSError as exc:
+            CAMERAS[camera_id]["gain_db"] = previous_gain
+            if previous_runtime:
+                RUNTIME_SETTINGS[camera_id] = previous_runtime
+            else:
+                RUNTIME_SETTINGS.pop(camera_id, None)
+            return jsonify({"error": f"unable to persist runtime settings: {exc}"}), 500
+    return jsonify({"camera": camera_id, "gain_db": gain_db, "reset": reset})
 
 
 @app.get("/jobs/<job_id>")
@@ -1244,7 +1415,9 @@ def stop_camera(camera_id: str):
         return auth_error()
     if camera_id not in WORKERS:
         return jsonify({"error": f"unknown camera: {camera_id}"}), 404
-    stopped = WORKERS[camera_id].stop(clear_queue=True)
+    worker = WORKERS[camera_id]
+    with worker.action_lock:
+        stopped = worker.stop(clear_queue=True)
     return jsonify({"status": "stopped", "camera": camera_id, "jobs_stopped": stopped})
 
 

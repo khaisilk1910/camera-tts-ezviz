@@ -1,4 +1,4 @@
-# Camera TTS EZVIZ Docker v2.3.3
+# Camera TTS EZVIZ Docker v2.4.0 (reviewed)
 
 Docker backend phát TTS và audio/nhạc ra loa camera EZVIZ/Hikvision qua HCNetSDK.
 
@@ -8,15 +8,17 @@ Home Assistant custom integration đã được tách sang repository riêng: `h
 
 - HCNetSDK tích hợp sẵn trong Docker image, host không cần cài SDK.
 - Nhiều camera qua `CAMERAS_JSON`.
-- Queue riêng từng camera, không phát chồng TTS trên cùng camera.
+- Queue riêng từng camera, hỗ trợ `add`, `next`, `play`, `replace`; không phát chồng audio trên cùng camera.
 - Persistent HCNetSDK login/worker để giảm độ trễ.
+- Guard mở lại VoiceTalk sau khi dừng/phát liên tiếp để giảm lỗi HCNetSDK do camera chưa nhả kênh.
 - Edge TTS + cache hai tầng: MP3 gốc và AAC cuối.
 - Single-flight: cùng nội dung đồng thời chỉ tạo audio một lần.
 - Cache riêng cho file/URL nhạc sau khi convert AAC.
 - Phát MP3/M4A/WAV/AAC/URL audio qua `POST /media`.
 - Dừng media và xóa queue camera qua `POST /stop/<camera>`.
 - Giữ nguyên `POST /say` để tương thích `rest_command` và automation cũ.
-- API `/cameras` cung cấp trạng thái cho Home Assistant Media Player integration.
+- API `/cameras` cung cấp trạng thái, backend capabilities và kết nối HCNetSDK cho Home Assistant.
+- Gain loa có thể chỉnh từ Home Assistant và lưu trong volume `/cache`.
 
 > VoiceTalk của camera dùng AAC-LC mono 16 kHz / 32 kbps. Nhạc phát được nhưng chất lượng phụ thuộc loa thoại của camera.
 
@@ -65,6 +67,7 @@ services:
 
       VOICE_START_DELAY_MS: "120"
       VOICE_END_DELAY_MS: "80"
+      VOICE_REOPEN_GUARD_MS: "1250"
       SENDER_START_TIMEOUT: "8"
 
       MEDIA_PREP_TIMEOUT: "900"
@@ -136,14 +139,16 @@ Danh sách camera:
 curl -H "X-API-Key: YOUR_API_KEY" http://192.168.31.100:8124/cameras
 ```
 
-TTS:
+TTS (mặc định nối cuối queue):
 
 ```bash
 curl -X POST http://192.168.31.100:8124/say/gate \
   -H "Content-Type: application/json" \
   -H "X-API-Key: YOUR_API_KEY" \
-  -d '{"text":"Xin chào các bạn"}'
+  -d '{"text":"Xin chào các bạn","queue_mode":"add"}'
 ```
+
+`queue_mode`: `add` = cuối hàng đợi, `next` = phát kế tiếp, `play` = ngắt item hiện tại nhưng giữ queue, `replace` = ngắt và xóa queue.
 
 Phát media URL:
 
@@ -167,6 +172,23 @@ Cache stats:
 curl -H "X-API-Key: YOUR_API_KEY" http://192.168.31.100:8124/cache/stats
 ```
 
+### Chỉnh gain loa runtime
+
+```bash
+curl -X PATCH http://192.168.31.100:8124/cameras/gate/settings \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -d '{"gain_db":6}'
+```
+
+Giá trị được lưu tại `/cache/runtime-settings.json`. Reset về giá trị Stack bằng `{"gain_db":"default"}`.
+
+## Chế độ local thực sự
+
+Đường **Docker → camera** luôn đi LAN trực tiếp qua HCNetSDK; không dùng EZVIZ cloud. Tuy nhiên endpoint `/say` vẫn dùng `edge-tts`, nên bản thân cách này cần Internet để tổng hợp giọng.
+
+Để TTS end-to-end local, dùng Home Assistant **Piper** với action `tts.speak` nhắm vào `media_player` của camera. Home Assistant tạo audio cục bộ, integration đưa URL Media Source nội bộ cho Docker, Docker chỉ convert AAC rồi gửi HCNetSDK trong LAN. Nếu yêu cầu hệ thống không được ra Internet, không dùng `/say`/`media_content_type: tts` trực tiếp.
+
 ## Home Assistant
 
 Cài repository HACS riêng `https://github.com/khaisilk1910/camera_tts_ezviz_hacs`. Integration sẽ đọc `/cameras` và tự tạo một `media_player` cho từng camera.
@@ -174,15 +196,6 @@ Cài repository HACS riêng `https://github.com/khaisilk1910/camera_tts_ezviz_ha
 REST API `/say` vẫn được giữ để các automation cũ tiếp tục chạy.
 
 
-## Sửa lỗi v2.3.3
+## Thay đổi v2.4.0
 
-- Sửa race/deadlock ở single-flight cache: khi tác vụ chuẩn bị audio hoàn thành ngay (thường là cache hit), callback của `Future` không còn có thể giữ treo request HTTP `/say` hoặc `/media`.
-- Tách thao tác stop HCNetSDK ra khỏi global enqueue lock để một camera đang dừng không làm chậm request của camera khác.
-- Media worker dùng đúng `MEDIA_PREP_TIMEOUT`; trước đây có thể bị cắt sớm bởi `PREP_TIMEOUT`.
-- Mặc định `LOG_SUCCESSFUL_JOBS=false`: Docker chỉ giữ log khởi động/cảnh báo/lỗi chính, tránh spam log khi phát thành công. Lỗi job ghi rõ `job`, `camera`, `kind`, `stage`, `type`, `detail`.
-
-Nếu cần log cả job thành công để benchmark, đặt:
-
-```env
-LOG_SUCCESSFUL_JOBS=true
-```
+Xem `CHANGES_2.4.0.md`. Bản này bổ sung queue chuẩn Home Assistant, runtime speaker gain, capability negotiation và guard mở lại HCNetSDK; đồng thời giữ các sửa lỗi deadlock/single-flight của v2.3.3.

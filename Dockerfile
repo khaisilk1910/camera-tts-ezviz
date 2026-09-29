@@ -22,7 +22,7 @@ RUN test -f /opt/hcnetsdk/incEn/HCNetSDK.h \
 
 FROM ubuntu:22.04
 
-ARG APP_VERSION=2.3.3
+ARG APP_VERSION=2.4.0
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -50,7 +50,7 @@ RUN chmod 0755 /usr/local/bin/send_aac \
     && test -x /usr/local/bin/send_aac \
     && test -f /opt/hcnetsdk/lib/libhcnetsdk.so \
     && test -f /opt/hcnetsdk/lib/HCNetSDKCom/libHCVoiceTalk.so \
-    && python3 -m py_compile /app/config.py /app/server.py
+    && python3 -m py_compile /app/config.py /app/queueing.py /app/server.py
 
 WORKDIR /app
 EXPOSE 8124

@@ -74,12 +74,16 @@ public:
         : user_id_(-1), voice_chan_((DWORD)env_int("VOICE_CHAN", 1)),
           sample_rate_(env_int("AUDIO_SAMPLE_RATE", 16000)),
           start_delay_ms_(env_int("VOICE_START_DELAY_MS", 120)),
-          end_delay_ms_(env_int("VOICE_END_DELAY_MS", 80)) {
+          end_delay_ms_(env_int("VOICE_END_DELAY_MS", 80)),
+          reopen_guard_ms_(env_int("VOICE_REOPEN_GUARD_MS", 1250)),
+          has_last_stop_(false) {
         if (sample_rate_ < 8000 || sample_rate_ > 48000) sample_rate_ = 16000;
         if (start_delay_ms_ < 0) start_delay_ms_ = 0;
         if (start_delay_ms_ > 2000) start_delay_ms_ = 2000;
         if (end_delay_ms_ < 0) end_delay_ms_ = 0;
         if (end_delay_ms_ > 2000) end_delay_ms_ = 2000;
+        if (reopen_guard_ms_ < 0) reopen_guard_ms_ = 0;
+        if (reopen_guard_ms_ > 5000) reopen_guard_ms_ = 5000;
     }
 
     ~CameraSession() { logout(); }
@@ -156,6 +160,13 @@ private:
             return false;
         }
 
+        if (has_last_stop_ && reopen_guard_ms_ > 0) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_stop_).count();
+            const long long remaining = (long long)reopen_guard_ms_ - elapsed;
+            if (remaining > 0) usleep((useconds_t)remaining * 1000U);
+        }
+
         const auto started = std::chrono::steady_clock::now();
         LONG voice_handle = NET_DVR_StartVoiceCom_MR_V30(user_id_, voice_chan_, VoiceCallback, NULL);
         if (voice_handle < 0) {
@@ -189,6 +200,8 @@ private:
 
         if (end_delay_ms_ > 0) usleep((useconds_t)end_delay_ms_ * 1000U);
         NET_DVR_StopVoiceCom(voice_handle);
+        last_stop_ = std::chrono::steady_clock::now();
+        has_last_stop_ = true;
         fclose(fp);
 
         const auto ended = std::chrono::steady_clock::now();
@@ -206,6 +219,9 @@ private:
     int sample_rate_;
     int start_delay_ms_;
     int end_delay_ms_;
+    int reopen_guard_ms_;
+    std::chrono::steady_clock::time_point last_stop_;
+    bool has_last_stop_;
 };
 
 static int run_worker() {
@@ -257,7 +273,7 @@ static int run_worker() {
         long long elapsed_ms = 0;
         std::string error;
         if (session.play(path, frames, elapsed_ms, error)) {
-            printf("OK\t%lu\t%lld\n", frames, elapsed_ms);
+            printf("OK\t%lu\t%lld\t%d\n", frames, elapsed_ms, (int)session.user_id());
         } else {
             printf("ERR\tPLAY_FAILED\t%s\n", error.c_str());
         }
