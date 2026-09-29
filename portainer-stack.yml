@@ -7,6 +7,7 @@ services:
     environment:
       # ===== Chỉ các biến thường chỉnh trong Portainer =====
       PORT: "${PORT:-8124}"
+      INTERCOM_PORT: "${INTERCOM_PORT:-8125}"
       API_KEY: "${API_KEY:-change-me-now}"
       DEFAULT_CAMERA: "${DEFAULT_CAMERA:-}"
       TTS_GAIN_DB: "${TTS_GAIN_DB:-4}"

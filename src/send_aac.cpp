@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cctype>
 #include <string>
 #include <vector>
 
@@ -76,7 +77,7 @@ public:
           start_delay_ms_(env_int("VOICE_START_DELAY_MS", 120)),
           end_delay_ms_(env_int("VOICE_END_DELAY_MS", 80)),
           reopen_guard_ms_(env_int("VOICE_REOPEN_GUARD_MS", 1250)),
-          has_last_stop_(false) {
+          has_last_stop_(false), stream_handle_(-1) {
         if (sample_rate_ < 8000 || sample_rate_ > 48000) sample_rate_ = 16000;
         if (start_delay_ms_ < 0) start_delay_ms_ = 0;
         if (start_delay_ms_ > 2000) start_delay_ms_ = 2000;
@@ -123,6 +124,10 @@ public:
     }
 
     void logout() {
+        if (stream_handle_ >= 0) {
+            NET_DVR_StopVoiceCom(stream_handle_);
+            stream_handle_ = -1;
+        }
         if (user_id_ >= 0) {
             NET_DVR_Logout(user_id_);
             user_id_ = -1;
@@ -150,6 +155,52 @@ public:
             usleep(100000);
         }
         return false;
+    }
+
+    bool stream_start(std::string &error) {
+        if (stream_handle_ >= 0) return true;
+        if (!login(true)) {
+            error = "login failed error=" + std::to_string((unsigned int)NET_DVR_GetLastError());
+            return false;
+        }
+        if (has_last_stop_ && reopen_guard_ms_ > 0) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_stop_).count();
+            const long long remaining = (long long)reopen_guard_ms_ - elapsed;
+            if (remaining > 0) usleep((useconds_t)remaining * 1000U);
+        }
+        stream_handle_ = NET_DVR_StartVoiceCom_MR_V30(user_id_, voice_chan_, VoiceCallback, NULL);
+        if (stream_handle_ < 0) {
+            error = "voice start failed error=" + std::to_string((unsigned int)NET_DVR_GetLastError());
+            return false;
+        }
+        if (start_delay_ms_ > 0) usleep((useconds_t)start_delay_ms_ * 1000U);
+        return true;
+    }
+
+    bool stream_frame(const std::vector<unsigned char> &frame, std::string &error) {
+        if (stream_handle_ < 0) { error = "stream not started"; return false; }
+        if (frame.empty()) { error = "empty frame"; return false; }
+        if (!NET_DVR_VoiceComSendData(stream_handle_, (char *)frame.data(), (DWORD)frame.size())) {
+            error = "send failed error=" + std::to_string((unsigned int)NET_DVR_GetLastError());
+            return false;
+        }
+        return true;
+    }
+
+    bool stream_stop(std::string &error) {
+        (void)error;
+        if (stream_handle_ < 0) return true;
+        if (end_delay_ms_ > 0) usleep((useconds_t)end_delay_ms_ * 1000U);
+        BOOL ok = NET_DVR_StopVoiceCom(stream_handle_);
+        stream_handle_ = -1;
+        last_stop_ = std::chrono::steady_clock::now();
+        has_last_stop_ = true;
+        if (!ok) {
+            error = "voice stop failed error=" + std::to_string((unsigned int)NET_DVR_GetLastError());
+            return false;
+        }
+        return true;
     }
 
 private:
@@ -222,7 +273,27 @@ private:
     int reopen_guard_ms_;
     std::chrono::steady_clock::time_point last_stop_;
     bool has_last_stop_;
+    LONG stream_handle_;
 };
+
+static bool hex_decode(const char *text, std::vector<unsigned char> &out) {
+    size_t n = strlen(text);
+    if (n == 0 || (n & 1) != 0 || n > 32768) return false;
+    out.clear();
+    out.reserve(n / 2);
+    auto val = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < n; i += 2) {
+        int a = val(text[i]), b = val(text[i + 1]);
+        if (a < 0 || b < 0) return false;
+        out.push_back((unsigned char)((a << 4) | b));
+    }
+    return true;
+}
 
 static int run_worker() {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -255,6 +326,30 @@ static int run_worker() {
         if (strcmp(line, "QUIT") == 0) {
             printf("BYE\n");
             break;
+        }
+
+        if (strcmp(line, "STREAM_BEGIN") == 0) {
+            std::string error;
+            if (session.stream_start(error)) printf("STREAM_READY\n");
+            else printf("ERR\tSTREAM_BEGIN\t%s\n", error.c_str());
+            continue;
+        }
+        if (strcmp(line, "STREAM_END") == 0) {
+            std::string error;
+            if (session.stream_stop(error)) printf("STREAM_DONE\n");
+            else printf("ERR\tSTREAM_END\t%s\n", error.c_str());
+            continue;
+        }
+        const char frame_prefix[] = "FRAME\t";
+        if (strncmp(line, frame_prefix, sizeof(frame_prefix) - 1) == 0) {
+            std::vector<unsigned char> frame;
+            std::string error;
+            if (!hex_decode(line + sizeof(frame_prefix) - 1, frame)) {
+                printf("ERR\tBAD_FRAME\tinvalid hex frame\n");
+            } else if (!session.stream_frame(frame, error)) {
+                printf("ERR\tSTREAM_FRAME\t%s\n", error.c_str());
+            }
+            continue;
         }
 
         const char prefix[] = "PLAY\t";

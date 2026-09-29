@@ -23,7 +23,7 @@ jobs:
 
       - name: Validate Python and unit tests
         run: |
-          python3 -m py_compile app/config.py app/server.py
+          python3 -m py_compile app/config.py app/queueing.py app/vendor_talk.py app/ptz.py app/intercom_server.py app/server.py
           python3 -m unittest discover -s tests -v
 
       - name: Validate Portainer Compose stack syntax

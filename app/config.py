@@ -12,6 +12,8 @@ CAMERA_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,48}$")
 PERCENT_RE = re.compile(r"^([+-])(\d{1,3})%$")
 BITRATE_RE = re.compile(r"^(\d{1,3})([kK]?)$")
 SLOT_RE = re.compile(r"^CAMERA_(\d{1,3})_")
+VENDORS = {"ezviz", "imou", "dahua"}
+VENDOR_ALIASES = {"hikvision": "ezviz", "hik": "ezviz"}
 
 
 class ConfigError(ValueError):
@@ -182,6 +184,13 @@ def _normalize_camera(raw: Mapping[str, Any], camera_id: str, settings: Settings
     if not CAMERA_ID_RE.fullmatch(camera_id):
         raise ConfigError(f"invalid camera id {camera_id!r}; use letters, numbers, dot, dash or underscore")
 
+    # `vendors` is accepted because it is the spelling used by the Docker JSON
+    # configuration requested by users. `vendor` is the canonical internal key.
+    vendor_raw = str(raw.get("vendor") or raw.get("vendors") or "ezviz").strip().lower()
+    vendor = VENDOR_ALIASES.get(vendor_raw, vendor_raw)
+    if vendor not in VENDORS:
+        raise ConfigError(f"camera {camera_id}: unsupported vendor {vendor_raw!r}; use ezviz, imou or dahua")
+
     ip = str(raw.get("ip", raw.get("host", ""))).strip()
     username = str(raw.get("username", raw.get("user", "admin"))).strip()
     password = str(raw.get("password", ""))
@@ -201,11 +210,26 @@ def _normalize_camera(raw: Mapping[str, Any], camera_id: str, settings: Settings
 
     rate = validate_percent(str(raw.get("rate", settings.tts_rate)), f"camera {camera_id} rate")
     edge_volume = validate_percent(str(raw.get("edge_volume", settings.tts_edge_volume)), f"camera {camera_id} edge_volume")
+    default_talk_port = settings.camera_default_port if vendor == "ezviz" else 37777
+    default_sample_rate = settings.tts_sample_rate if vendor == "ezviz" else 16000
+    ptz_enabled = parse_bool(raw.get("ptz", raw.get("ptz_enabled")), False)
+    ptz_protocol = str(raw.get("ptz_protocol", "auto")).strip().lower() or "auto"
+    if ptz_protocol not in {"auto", "dahua", "isapi", "none"}:
+        raise ConfigError(f"camera {camera_id}: ptz_protocol must be auto, dahua, isapi or none")
+    if ptz_protocol == "auto":
+        ptz_protocol = "dahua" if vendor in {"imou", "dahua"} else "isapi"
+    if not ptz_enabled:
+        ptz_protocol = "none"
+
+    mic_url = str(raw.get("mic_url", "")).strip()
+    if mic_url and not mic_url.lower().startswith(("rtsp://", "http://", "https://")):
+        raise ConfigError(f"camera {camera_id}: mic_url must start with rtsp://, http:// or https://")
 
     return {
         "id": camera_id,
+        "vendor": vendor,
         "ip": ip,
-        "port": parse_int(raw.get("port"), f"camera {camera_id} port", settings.camera_default_port, 1, 65535),
+        "port": parse_int(raw.get("port"), f"camera {camera_id} port", default_talk_port, 1, 65535),
         "username": username,
         "password": password,
         "voice_chan": parse_int(raw.get("voice_chan"), f"camera {camera_id} voice_chan", settings.camera_default_voice_chan, 1, 64),
@@ -214,10 +238,17 @@ def _normalize_camera(raw: Mapping[str, Any], camera_id: str, settings: Settings
         "rate": rate,
         "edge_volume": edge_volume,
         "gain_db": parse_float(raw.get("gain_db"), f"camera {camera_id} gain_db", settings.tts_gain_db, -20.0, 12.0),
-        "sample_rate": parse_int(raw.get("sample_rate"), f"camera {camera_id} sample_rate", settings.tts_sample_rate, 8000, 48000),
+        "sample_rate": parse_int(raw.get("sample_rate"), f"camera {camera_id} sample_rate", default_sample_rate, 8000, 48000),
         "bitrate": validate_bitrate(str(raw.get("bitrate", settings.tts_bitrate)), f"camera {camera_id} bitrate"),
+        "mic_url": mic_url,
+        "ptz_enabled": ptz_enabled,
+        "ptz_protocol": ptz_protocol,
+        "ptz_port": parse_int(raw.get("ptz_port"), f"camera {camera_id} ptz_port", 80, 1, 65535),
+        "ptz_channel": parse_int(raw.get("ptz_channel"), f"camera {camera_id} ptz_channel", 1 if ptz_protocol == "isapi" else 0, 0, 64),
+        "ptz_speed": parse_int(raw.get("ptz_speed"), f"camera {camera_id} ptz_speed", 50, 1, 100),
+        "intercom": parse_bool(raw.get("intercom"), True),
+        "intercom_key": str(raw.get("intercom_key", "")).strip(),
     }
-
 
 def _json_camera_entries(env: Mapping[str, str]) -> list[tuple[str, Mapping[str, Any]]]:
     raw_json = str(env.get("CAMERAS_JSON", "")).strip()
@@ -299,6 +330,17 @@ def _indexed_camera_entries(env: Mapping[str, str]) -> list[tuple[str, Mapping[s
             "edge_volume": _slot_value(env, slot, "EDGE_VOLUME", ""),
             "sample_rate": _slot_value(env, slot, "SAMPLE_RATE", ""),
             "bitrate": _slot_value(env, slot, "BITRATE", ""),
+            "vendors": (_slot_value(env, slot, "VENDOR", "")
+                        or _slot_value(env, slot, "VENDORS", "ezviz")
+                        or "ezviz"),
+            "mic_url": _slot_value(env, slot, "MIC_URL", ""),
+            "ptz": _slot_value(env, slot, "PTZ", ""),
+            "ptz_protocol": _slot_value(env, slot, "PTZ_PROTOCOL", ""),
+            "ptz_port": _slot_value(env, slot, "PTZ_PORT", ""),
+            "ptz_channel": _slot_value(env, slot, "PTZ_CHANNEL", ""),
+            "ptz_speed": _slot_value(env, slot, "PTZ_SPEED", ""),
+            "intercom": _slot_value(env, slot, "INTERCOM", ""),
+            "intercom_key": _slot_value(env, slot, "INTERCOM_KEY", ""),
         }
         # Empty optional values should fall back to global defaults rather than
         # being interpreted as explicit empty strings.
@@ -319,9 +361,9 @@ def load_cameras(settings: Settings, env: Mapping[str, str] | None = None) -> tu
         cameras[camera_id] = camera
 
     if not settings.allow_duplicate_camera_targets:
-        seen_targets: dict[tuple[str, int, int], str] = {}
+        seen_targets: dict[tuple[str, str, int, int], str] = {}
         for camera_id, camera in cameras.items():
-            target = (camera["ip"].lower(), int(camera["port"]), int(camera["voice_chan"]))
+            target = (camera["vendor"], camera["ip"].lower(), int(camera["port"]), int(camera["voice_chan"]))
             existing = seen_targets.get(target)
             if existing:
                 raise ConfigError(

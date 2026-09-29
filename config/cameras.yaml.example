@@ -1,25 +1,35 @@
+# Human-readable reference only. Runtime configuration is currently read from
+# CAMERAS_JSON or CAMERA_XX_* environment variables.
 default_camera: gate
-
-defaults:
-  port: 8000
-  voice_chan: 1
-  voice: vi-VN-HoaiMyNeural
-  rate: "+0%"
-  edge_volume: "+0%"
-  gain_db: 4
-  sample_rate: 16000
-  bitrate: 32k
-  queue_size: 20
 
 cameras:
   gate:
+    vendors: ezviz
     ip: "192.168.31.59"
+    port: 8000
     username: "admin"
-    password_file: "/run/secrets/cam_gate_password"
+    password: "CHANGE_ME"
+    ptz: true
+    ptz_protocol: isapi
+    ptz_port: 80
+    ptz_channel: 1
+    ptz_speed: 50
+    mic_url: "rtsp://admin:CHANGE_ME@192.168.31.59:554/Streaming/Channels/102"
 
-  # Example:
-  # yard:
-  #   ip: "192.168.31.60"
-  #   username: "admin"
-  #   password_file: "/run/secrets/cam_yard_password"
-  #   gain_db: 5
+  yard:
+    vendors: imou
+    ip: "192.168.31.60"
+    username: "admin"
+    password: "CHANGE_ME"
+    # Talk: 8086/AAC 16 kHz preferred, 37777/PCM 8 kHz fallback.
+    ptz: true
+    ptz_protocol: dahua
+    ptz_port: 80
+    ptz_channel: 0
+    mic_url: "rtsp://admin:CHANGE_ME@192.168.31.60:554/cam/realmonitor?channel=1&subtype=1"
+
+  garage:
+    vendors: dahua
+    ip: "192.168.31.61"
+    username: "admin"
+    password: "CHANGE_ME"

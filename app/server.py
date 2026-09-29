@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -21,9 +22,25 @@ from waitress import serve
 
 from config import ConfigError, load_cameras, load_settings, parse_float, public_settings, validate_percent
 from queueing import PlaybackQueue, normalize_queue_mode
+from vendor_talk import ImouDahuaSender, TalkError, split_adts
+from ptz import PTZError, ptz_move
+from intercom_server import IntercomServer, intercom_token
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2.4.0")
+APP_VERSION = os.environ.get("APP_VERSION", "2.5.0")
+_INTERCOM_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_INTERCOM_IPV6_RE = re.compile(r"^[0-9A-Fa-f:]+$")
+
+
+def _safe_intercom_host(value: str) -> str:
+    """Validate a host before embedding it in a go2rtc exec command."""
+    host = str(value or "").strip()
+    if _INTERCOM_HOSTNAME_RE.fullmatch(host):
+        return host
+    if _INTERCOM_IPV6_RE.fullmatch(host) and ":" in host:
+        return f"[{host}]"
+    raise ValueError("host must be a hostname, IPv4 address, or plain IPv6 address")
+
 app = Flask(__name__)
 
 SETTINGS = load_settings()
@@ -31,10 +48,14 @@ CACHE_DIR = Path(SETTINGS.cache_dir)
 BASE_CACHE_DIR = CACHE_DIR / "base"
 AAC_CACHE_DIR = CACHE_DIR / "aac"
 MEDIA_CACHE_DIR = CACHE_DIR / "media"
+PCM_CACHE_DIR = CACHE_DIR / "pcm"
+UPLOAD_CACHE_DIR = CACHE_DIR / "upload"
 BASE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 AAC_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 MEDIA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
+PCM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
 RUNTIME_SETTINGS_FILE = CACHE_DIR / "runtime-settings.json"
 runtime_settings_lock = threading.Lock()
@@ -67,6 +88,7 @@ MEDIA_PREP_TIMEOUT = max(30, min(int(os.environ.get("MEDIA_PREP_TIMEOUT", "900")
 MEDIA_SEND_TIMEOUT = max(60, min(int(os.environ.get("MEDIA_SEND_TIMEOUT", "7200")), 21600))
 MEDIA_MAX_URL_LENGTH = max(256, min(int(os.environ.get("MEDIA_MAX_URL_LENGTH", "4096")), 16384))
 LOG_SUCCESSFUL_JOBS = os.environ.get("LOG_SUCCESSFUL_JOBS", "false").strip().lower() in {"1", "true", "yes", "on"}
+INTERCOM_PORT = max(1024, min(int(os.environ.get("INTERCOM_PORT", "8125")), 65535))
 
 CONFIG_ERROR = ""
 try:
@@ -302,6 +324,7 @@ def audio_spec(camera_cfg: dict[str, Any], text: str, data: dict[str, Any]) -> d
         "gain_db": gain_db,
         "sample_rate": int(camera_cfg.get("sample_rate", SETTINGS.tts_sample_rate)),
         "bitrate": str(camera_cfg.get("bitrate", SETTINGS.tts_bitrate)),
+        "vendor": str(camera_cfg.get("vendor", "ezviz")),
     }
 
 
@@ -320,71 +343,64 @@ def audio_keys(spec: dict[str, Any]) -> tuple[str, str]:
         "gain_db": float(spec["gain_db"]),
         "sample_rate": int(spec["sample_rate"]),
         "bitrate": str(spec["bitrate"]),
+        "vendor": str(spec.get("vendor", "ezviz")),
     }
     aac_raw = json.dumps(aac_spec, sort_keys=True, separators=(",", ":"))
     aac_key = hashlib.sha256(aac_raw.encode("utf-8")).hexdigest()
     return base_key, aac_key
 
 
+def _final_audio_path(cache_dir: Path, key: str, vendor: str) -> Path:
+    return cache_dir / f"{key}.aac" if vendor == "ezviz" else cache_dir / f"{key}.wav"
+
+
+def _ffmpeg_output_args(spec: dict[str, Any], output_path: Path) -> list[str]:
+    vendor = str(spec.get("vendor", "ezviz"))
+    if vendor == "ezviz":
+        return [
+            "-c:a", "aac", "-profile:a", "aac_low", "-b:a", str(spec["bitrate"]),
+            "-f", "adts", str(output_path),
+        ]
+    return ["-c:a", "pcm_s16le", "-f", "wav", str(output_path)]
+
+
 def prepare_audio(spec: dict[str, Any]) -> dict[str, Any]:
     started = time.monotonic()
-    base_key, aac_key = audio_keys(spec)
+    base_key, final_key = audio_keys(spec)
     base_mp3 = BASE_CACHE_DIR / f"{base_key}.mp3"
-    final_aac = AAC_CACHE_DIR / f"{aac_key}.aac"
+    vendor = str(spec.get("vendor", "ezviz"))
+    final_path = _final_audio_path(AAC_CACHE_DIR if vendor == "ezviz" else PCM_CACHE_DIR, final_key, vendor)
 
-    if valid_cache_file(final_aac):
-        stat_inc("aac_hits")
-        touch_cache(final_aac)
-        return {
-            "path": str(final_aac),
-            "cache": "aac-hit",
-            "base_cache": "n/a",
-            "prepare_ms": round((time.monotonic() - started) * 1000.0, 1),
-        }
+    if valid_cache_file(final_path):
+        stat_inc("aac_hits" if vendor == "ezviz" else "pcm_hits")
+        touch_cache(final_path)
+        return {"path": str(final_path), "cache": f"{vendor}-hit", "base_cache": "n/a",
+                "prepare_ms": round((time.monotonic() - started) * 1000.0, 1)}
 
-    stat_inc("aac_misses")
-    aac_lock = aac_locks[int(aac_key[:8], 16) % len(aac_locks)]
-    with aac_lock:
-        if valid_cache_file(final_aac):
-            stat_inc("aac_hits")
-            touch_cache(final_aac)
-            return {
-                "path": str(final_aac),
-                "cache": "aac-hit-after-wait",
-                "base_cache": "n/a",
-                "prepare_ms": round((time.monotonic() - started) * 1000.0, 1),
-            }
+    stat_inc("aac_misses" if vendor == "ezviz" else "pcm_misses")
+    final_lock = aac_locks[int(final_key[:8], 16) % len(aac_locks)]
+    with final_lock:
+        if valid_cache_file(final_path):
+            touch_cache(final_path)
+            return {"path": str(final_path), "cache": f"{vendor}-hit-after-wait", "base_cache": "n/a",
+                    "prepare_ms": round((time.monotonic() - started) * 1000.0, 1)}
 
         base_cache_state = "hit"
         if valid_cache_file(base_mp3):
-            stat_inc("base_hits")
-            touch_cache(base_mp3)
+            stat_inc("base_hits"); touch_cache(base_mp3)
         else:
-            stat_inc("base_misses")
-            base_cache_state = "miss"
+            stat_inc("base_misses"); base_cache_state = "miss"
             base_lock = base_locks[int(base_key[:8], 16) % len(base_locks)]
             with base_lock:
                 if valid_cache_file(base_mp3):
-                    stat_inc("base_hits")
-                    touch_cache(base_mp3)
-                    base_cache_state = "hit-after-wait"
+                    stat_inc("base_hits"); touch_cache(base_mp3); base_cache_state = "hit-after-wait"
                 else:
                     tmp_mp3 = BASE_CACHE_DIR / f".{base_key}.{uuid.uuid4().hex}.mp3"
                     try:
-                        subprocess.run(
-                            [
-                                SETTINGS.edge_tts,
-                                "--voice", spec["voice"],
-                                "--rate", spec["rate"],
-                                "--volume", spec["edge_volume"],
-                                "--text", spec["text"],
-                                "--write-media", str(tmp_mp3),
-                            ],
-                            check=True,
-                            capture_output=True,
-                            text=True,
-                            timeout=SETTINGS.tts_timeout,
-                        )
+                        subprocess.run([SETTINGS.edge_tts, "--voice", spec["voice"], "--rate", spec["rate"],
+                                        "--volume", spec["edge_volume"], "--text", spec["text"],
+                                        "--write-media", str(tmp_mp3)], check=True, capture_output=True, text=True,
+                                       timeout=SETTINGS.tts_timeout)
                         if not valid_cache_file(tmp_mp3):
                             raise RuntimeError("edge-tts produced an empty media file")
                         os.replace(tmp_mp3, base_mp3)
@@ -392,55 +408,29 @@ def prepare_audio(spec: dict[str, Any]) -> dict[str, Any]:
                         detail = (exc.stderr or exc.stdout or str(exc)).strip()
                         raise RuntimeError(detail[-1200:] if detail else "edge-tts failed") from exc
                     finally:
-                        try:
-                            tmp_mp3.unlink()
-                        except FileNotFoundError:
-                            pass
+                        try: tmp_mp3.unlink()
+                        except FileNotFoundError: pass
 
-        tmp_aac = AAC_CACHE_DIR / f".{aac_key}.{uuid.uuid4().hex}.aac"
+        tmp_final = final_path.with_name(f".{final_path.stem}.{uuid.uuid4().hex}{final_path.suffix}")
         try:
             gain_db = max(-20.0, min(float(spec["gain_db"]), 12.0))
             audio_filter = f"volume={gain_db}dB,alimiter=limit=0.97"
-            subprocess.run(
-                [
-                    SETTINGS.ffmpeg,
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel", "error",
-                    "-i", str(base_mp3),
-                    "-vn",
-                    "-ac", "1",
-                    "-ar", str(spec["sample_rate"]),
-                    "-af", audio_filter,
-                    "-c:a", "aac",
-                    "-profile:a", "aac_low",
-                    "-b:a", spec["bitrate"],
-                    "-f", "adts",
-                    str(tmp_aac),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=SETTINGS.tts_timeout,
-            )
-            if not valid_cache_file(tmp_aac):
-                raise RuntimeError("ffmpeg produced an empty AAC file")
-            os.replace(tmp_aac, final_aac)
+            cmd = [SETTINGS.ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(base_mp3),
+                   "-vn", "-ac", "1", "-ar", str(spec["sample_rate"]), "-af", audio_filter,
+                   *_ffmpeg_output_args(spec, tmp_final)]
+            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=SETTINGS.tts_timeout)
+            if not valid_cache_file(tmp_final):
+                raise RuntimeError("ffmpeg produced an empty prepared audio file")
+            os.replace(tmp_final, final_path)
             stat_inc("generated")
-            return {
-                "path": str(final_aac),
-                "cache": "generated",
-                "base_cache": base_cache_state,
-                "prepare_ms": round((time.monotonic() - started) * 1000.0, 1),
-            }
+            return {"path": str(final_path), "cache": f"{vendor}-generated", "base_cache": base_cache_state,
+                    "prepare_ms": round((time.monotonic() - started) * 1000.0, 1)}
         except subprocess.CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
             raise RuntimeError(detail[-1200:] if detail else "ffmpeg failed") from exc
         finally:
-            try:
-                tmp_aac.unlink()
-            except FileNotFoundError:
-                pass
+            try: tmp_final.unlink()
+            except FileNotFoundError: pass
 
 
 def _submit_singleflight(key: str, prepare_fn, spec: dict[str, Any]) -> Future:
@@ -497,6 +487,7 @@ def media_spec(camera_cfg: dict[str, Any], media_url: str, data: dict[str, Any])
         "gain_db": gain_db,
         "sample_rate": int(camera_cfg.get("sample_rate", SETTINGS.tts_sample_rate)),
         "bitrate": str(camera_cfg.get("bitrate", SETTINGS.tts_bitrate)),
+        "vendor": str(camera_cfg.get("vendor", "ezviz")),
     }
 
 
@@ -507,6 +498,7 @@ def media_key(spec: dict[str, Any]) -> str:
             "gain_db": float(spec["gain_db"]),
             "sample_rate": int(spec["sample_rate"]),
             "bitrate": str(spec["bitrate"]),
+            "vendor": str(spec.get("vendor", "ezviz")),
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -518,75 +510,89 @@ def media_key(spec: dict[str, Any]) -> str:
 def prepare_media(spec: dict[str, Any]) -> dict[str, Any]:
     started = time.monotonic()
     key = media_key(spec)
-    final_aac = MEDIA_CACHE_DIR / f"{key}.aac"
+    vendor = str(spec.get("vendor", "ezviz"))
+    final_path = _final_audio_path(MEDIA_CACHE_DIR, key, vendor)
 
-    if valid_cache_file(final_aac):
-        stat_inc("media_hits")
-        touch_cache(final_aac)
-        return {
-            "path": str(final_aac),
-            "cache": "media-hit",
-            "prepare_ms": round((time.monotonic() - started) * 1000.0, 1),
-        }
+    if valid_cache_file(final_path):
+        stat_inc("media_hits"); touch_cache(final_path)
+        return {"path": str(final_path), "cache": "media-hit",
+                "prepare_ms": round((time.monotonic() - started) * 1000.0, 1)}
 
     stat_inc("media_misses")
     lock = aac_locks[int(key[:8], 16) % len(aac_locks)]
     with lock:
-        if valid_cache_file(final_aac):
-            stat_inc("media_hits")
-            touch_cache(final_aac)
-            return {
-                "path": str(final_aac),
-                "cache": "media-hit-after-wait",
-                "prepare_ms": round((time.monotonic() - started) * 1000.0, 1),
-            }
-
-        tmp_aac = MEDIA_CACHE_DIR / f".{key}.{uuid.uuid4().hex}.aac"
+        if valid_cache_file(final_path):
+            stat_inc("media_hits"); touch_cache(final_path)
+            return {"path": str(final_path), "cache": "media-hit-after-wait",
+                    "prepare_ms": round((time.monotonic() - started) * 1000.0, 1)}
+        tmp_final = final_path.with_name(f".{final_path.stem}.{uuid.uuid4().hex}{final_path.suffix}")
         try:
             gain_db = max(-20.0, min(float(spec["gain_db"]), 12.0))
             audio_filter = f"volume={gain_db}dB,alimiter=limit=0.97"
-            subprocess.run(
-                [
-                    SETTINGS.ffmpeg,
-                    "-nostdin",
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel", "error",
-                    "-i", spec["url"],
-                    "-vn",
-                    "-ac", "1",
-                    "-ar", str(spec["sample_rate"]),
-                    "-af", audio_filter,
-                    "-c:a", "aac",
-                    "-profile:a", "aac_low",
-                    "-b:a", spec["bitrate"],
-                    "-f", "adts",
-                    str(tmp_aac),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=MEDIA_PREP_TIMEOUT,
-            )
-            if not valid_cache_file(tmp_aac):
-                raise RuntimeError("ffmpeg produced an empty media AAC file")
-            os.replace(tmp_aac, final_aac)
-            stat_inc("media_generated")
-            return {
-                "path": str(final_aac),
-                "cache": "media-generated",
-                "prepare_ms": round((time.monotonic() - started) * 1000.0, 1),
-            }
+            cmd = [SETTINGS.ffmpeg, "-nostdin", "-y", "-hide_banner", "-loglevel", "error", "-i", spec["url"],
+                   "-vn", "-ac", "1", "-ar", str(spec["sample_rate"]), "-af", audio_filter,
+                   *_ffmpeg_output_args(spec, tmp_final)]
+            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=MEDIA_PREP_TIMEOUT)
+            if not valid_cache_file(tmp_final):
+                raise RuntimeError("ffmpeg produced an empty media file")
+            os.replace(tmp_final, final_path); stat_inc("media_generated")
+            return {"path": str(final_path), "cache": "media-generated",
+                    "prepare_ms": round((time.monotonic() - started) * 1000.0, 1)}
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(f"media preparation timed out after {MEDIA_PREP_TIMEOUT}s") from exc
         except subprocess.CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
             raise RuntimeError(detail[-1200:] if detail else "ffmpeg media conversion failed") from exc
         finally:
-            try:
-                tmp_aac.unlink()
-            except FileNotFoundError:
-                pass
+            try: tmp_final.unlink()
+            except FileNotFoundError: pass
+
+
+def uploaded_audio_spec(camera_cfg: dict[str, Any], content: bytes, data: dict[str, Any]) -> dict[str, Any]:
+    gain_db = float(camera_cfg.get("gain_db", SETTINGS.tts_gain_db))
+    if data.get("gain_db") not in (None, "") and SETTINGS.allow_request_overrides:
+        gain_db = parse_float(data["gain_db"], "gain_db", gain_db, -20.0, 12.0)
+    return {"content": content, "content_hash": hashlib.sha256(content).hexdigest(),
+            "gain_db": gain_db, "sample_rate": int(camera_cfg.get("sample_rate", SETTINGS.tts_sample_rate)),
+            "bitrate": str(camera_cfg.get("bitrate", SETTINGS.tts_bitrate)),
+            "vendor": str(camera_cfg.get("vendor", "ezviz"))}
+
+
+def uploaded_audio_key(spec: dict[str, Any]) -> str:
+    raw = json.dumps({k: spec[k] for k in ("content_hash", "gain_db", "sample_rate", "bitrate", "vendor")},
+                     sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def prepare_uploaded_audio(spec: dict[str, Any]) -> dict[str, Any]:
+    started = time.monotonic(); key = uploaded_audio_key(spec); vendor = spec["vendor"]
+    final_path = _final_audio_path(UPLOAD_CACHE_DIR, key, vendor)
+    if valid_cache_file(final_path):
+        touch_cache(final_path)
+        return {"path": str(final_path), "cache": "upload-hit",
+                "prepare_ms": round((time.monotonic()-started)*1000, 1)}
+    lock = aac_locks[int(key[:8],16)%len(aac_locks)]
+    with lock:
+        if valid_cache_file(final_path):
+            touch_cache(final_path)
+            return {"path": str(final_path), "cache": "upload-hit-after-wait",
+                    "prepare_ms": round((time.monotonic()-started)*1000, 1)}
+        tmp_final = final_path.with_name(f".{final_path.stem}.{uuid.uuid4().hex}{final_path.suffix}")
+        gain_db=max(-20.0,min(float(spec["gain_db"]),12.0)); audio_filter=f"volume={gain_db}dB,alimiter=limit=0.97"
+        cmd=[SETTINGS.ffmpeg,"-y","-hide_banner","-loglevel","error","-i","pipe:0","-vn","-ac","1",
+             "-ar",str(spec["sample_rate"]),"-af",audio_filter,*_ffmpeg_output_args(spec,tmp_final)]
+        try:
+            proc=subprocess.run(cmd,input=spec["content"],check=True,capture_output=True,timeout=SETTINGS.tts_timeout)
+            if not valid_cache_file(tmp_final): raise RuntimeError("ffmpeg produced empty uploaded audio")
+            os.replace(tmp_final,final_path)
+            return {"path":str(final_path),"cache":"upload-generated",
+                    "prepare_ms":round((time.monotonic()-started)*1000,1)}
+        except subprocess.CalledProcessError as exc:
+            detail=(exc.stderr or b"").decode(errors="replace").strip()
+            raise RuntimeError(detail[-1200:] if detail else "ffmpeg uploaded-audio conversion failed") from exc
+        finally:
+            try: tmp_final.unlink()
+            except FileNotFoundError: pass
 
 
 def get_media_future(spec: dict[str, Any]) -> Future:
@@ -819,6 +825,91 @@ class PersistentCameraSender:
 
         raise RuntimeError(self.last_error or "HCNetSDK playback failed")
 
+    def play_stream_pcm(self, chunks, *, input_rate: int = 8000) -> dict[str, Any]:
+        """Encode a live PCM16 stream to AAC and keep one HCNetSDK VoiceTalk open."""
+        started = time.monotonic()
+        with self.command_lock:
+            self.stop_requested.clear()
+            self._wait_after_forced_stop()
+            self._ensure_started()
+            proc = self.proc
+            if proc is None or proc.stdin is None:
+                raise RuntimeError("HCNetSDK worker is unavailable")
+            proc.stdin.write("STREAM_BEGIN\n"); proc.stdin.flush()
+            try:
+                line = self._next_response(proc, SENDER_START_TIMEOUT + 5)
+            except queue.Empty as exc:
+                raise RuntimeError("HCNetSDK intercom stream did not start") from exc
+            if line != "STREAM_READY":
+                raise RuntimeError(f"HCNetSDK intercom start failed: {line}")
+
+            ff = subprocess.Popen([SETTINGS.ffmpeg, "-hide_banner", "-loglevel", "error",
+                                   "-probesize", "32", "-analyzeduration", "0", "-fflags", "nobuffer",
+                                   "-f", "s16le", "-ar", str(input_rate), "-ac", "1", "-i", "pipe:0",
+                                   "-ar", str(self.cfg.get("sample_rate", SETTINGS.tts_sample_rate)),
+                                   "-c:a", "aac", "-b:a", str(self.cfg.get("bitrate", SETTINGS.tts_bitrate)),
+                                   "-f", "adts", "-flush_packets", "1", "pipe:1"],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            encoder_error: list[str] = []
+            frames_sent = 0
+
+            def pump() -> None:
+                nonlocal frames_sent
+                assert ff.stdout is not None
+                buf = b""
+                try:
+                    while True:
+                        part = ff.stdout.read1(4096)
+                        if not part:
+                            break
+                        frames, buf = split_adts(buf + part)
+                        for frame in frames:
+                            proc.stdin.write("FRAME\t" + frame.hex() + "\n")
+                            proc.stdin.flush()
+                            frames_sent += 1
+                except Exception as exc:
+                    encoder_error.append(str(exc))
+
+            pump_thread = threading.Thread(target=pump, daemon=True, name=f"sdk-stream-{self.camera_id}")
+            pump_thread.start()
+            try:
+                assert ff.stdin is not None
+                for chunk in chunks:
+                    if self.stop_requested.is_set():
+                        break
+                    if chunk:
+                        ff.stdin.write(chunk); ff.stdin.flush()
+            finally:
+                try:
+                    assert ff.stdin is not None
+                    ff.stdin.close()
+                except OSError:
+                    pass
+                pump_thread.join(10)
+                try:
+                    ff.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    ff.kill(); ff.wait()
+                proc.stdin.write("STREAM_END\n"); proc.stdin.flush()
+
+            error_line = encoder_error[0] if encoder_error else ""
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline:
+                try:
+                    response = self._next_response(proc, max(0.1, deadline - time.monotonic()))
+                except queue.Empty:
+                    break
+                if response == "STREAM_DONE":
+                    if error_line:
+                        raise RuntimeError(f"intercom encoder failed: {error_line}")
+                    self.last_error = None
+                    return {"transport": "hcnetsdk-live", "frames": frames_sent,
+                            "sender_ms": round((time.monotonic() - started) * 1000, 1)}
+                if response.startswith("ERR\t") and not error_line:
+                    error_line = response
+            self.last_error = error_line or "intercom stream did not close cleanly"
+            raise RuntimeError(self.last_error)
+
     def stop_current(self) -> None:
         self.stop_requested.set()
         proc = self.proc
@@ -859,7 +950,7 @@ class CameraWorker:
         # Serialize stop/queue-mode/enqueue operations per camera. This avoids
         # REPLACE/PLAY races without blocking unrelated cameras.
         self.action_lock = threading.Lock()
-        self.sender = PersistentCameraSender(camera_id, cfg)
+        self.sender = (PersistentCameraSender(camera_id, cfg) if cfg.get("vendor", "ezviz") == "ezviz" else ImouDahuaSender(camera_id, cfg, ffmpeg=SETTINGS.ffmpeg))
         self.thread = threading.Thread(target=self.run, daemon=True, name=f"camera-{camera_id}")
         self.thread.start()
 
@@ -940,7 +1031,7 @@ class CameraWorker:
                         prepare_ms=prepared.get("prepare_ms"),
                         status="playing",
                     )
-                    stage = "hcnetsdk_playback"
+                    stage = f"{self.cfg.get('vendor', 'ezviz')}_playback"
                     mark_job_stage(job_id, "play_start_ms")
                 if LOG_SUCCESSFUL_JOBS:
                     log(
@@ -953,7 +1044,7 @@ class CameraWorker:
                 if LOG_SUCCESSFUL_JOBS:
                     log(
                         f"[{job_id}] camera={self.camera_id} kind={kind} stage=done "
-                        f"sdk_ms={play_result.get('sdk_ms')} sender_ms={play_result.get('sender_ms')}"
+                        f"transport={play_result.get('transport') or 'hcnetsdk'} sender_ms={play_result.get('sender_ms')}"
                     )
             except PlaybackStopped:
                 mark_job_stage(job_id, "stopped_ms")
@@ -961,20 +1052,15 @@ class CameraWorker:
                 if LOG_SUCCESSFUL_JOBS:
                     log(f"[{job_id}] camera={self.camera_id} kind={kind} stage={stage} STOPPED")
             except Exception as exc:
-                mark_job_stage(job_id, "error_ms")
-                error_type = exc.__class__.__name__
-                error_text = str(exc) or error_type
-                self._finish_current(
-                    job_id,
-                    status="error",
-                    error=error_text,
-                    error_type=error_type,
-                    error_stage=stage,
-                )
-                log(
-                    f"ERROR job={job_id} camera={self.camera_id} kind={kind} "
-                    f"stage={stage} type={error_type} detail={error_text}"
-                )
+                if self._is_cancelled(job_id):
+                    mark_job_stage(job_id, "stopped_ms")
+                    self._finish_current(job_id, status="stopped", error_stage=stage)
+                else:
+                    mark_job_stage(job_id, "error_ms")
+                    error_type = exc.__class__.__name__
+                    error_text = str(exc) or error_type
+                    self._finish_current(job_id, status="error", error=error_text, error_type=error_type, error_stage=stage)
+                    log(f"ERROR job={job_id} camera={self.camera_id} kind={kind} stage={stage} type={error_type} detail={error_text}")
             finally:
                 self._clear_cancelled(job_id)
                 # Terminal paths normally clear current_job via _finish_current.
@@ -986,6 +1072,10 @@ class CameraWorker:
 
 
 WORKERS = {camera_id: CameraWorker(camera_id, cfg) for camera_id, cfg in CAMERAS.items()}
+INTERCOM_SERVER = IntercomServer(WORKERS, CAMERAS, SETTINGS.api_key, INTERCOM_PORT, log)
+INTERCOM_AVAILABLE = False
+if any(bool(cfg.get("intercom", True)) for cfg in CAMERAS.values()):
+    INTERCOM_AVAILABLE = INTERCOM_SERVER.start()
 
 
 def require_auth() -> bool:
@@ -1188,8 +1278,8 @@ def root():
             "service": "camera-tts-ezviz",
             "version": APP_VERSION,
             "status": "ready" if CAMERAS and not CONFIG_ERROR else "needs-configuration",
-            "optimizations": ["persistent-hcnetsdk-login", "voice-reopen-guard", "priority-queue", "two-level-cache", "singleflight", "parallel-prepare", "runtime-gain", "media-player"],
-            "endpoints": ["/health", "/cameras", "/cameras/<camera_id>/settings", "/cache/stats", "/config", "/say", "/say/<camera_id>", "/media", "/media/<camera_id>", "/stop/<camera_id>", "/jobs/<job_id>"],
+            "optimizations": ["vendor-adapters", "persistent-hcnetsdk-login", "lazy-imou-talk", "voice-reopen-guard", "priority-queue", "two-level-cache", "singleflight", "parallel-prepare", "runtime-gain", "media-player", "on-demand-ptz"],
+            "endpoints": ["/health", "/cameras", "/cameras/<camera_id>/settings", "/cache/stats", "/config", "/say", "/say/<camera_id>", "/media", "/media/<camera_id>", "/audio/<camera_id>", "/ptz/<camera_id>", "/cameras/<camera_id>/intercom-source", "/stop/<camera_id>", "/jobs/<job_id>"],
         }
     )
 
@@ -1267,6 +1357,7 @@ def cameras_view():
         result.append(
             {
                 "id": camera_id,
+                "vendor": cfg.get("vendor", "ezviz"),
                 "ip": cfg["ip"],
                 "port": cfg["port"],
                 "voice_chan": cfg["voice_chan"],
@@ -1275,6 +1366,13 @@ def cameras_view():
                 "queue_size": int(cfg.get("queue_size", SETTINGS.queue_size)),
                 "sample_rate": cfg["sample_rate"],
                 "bitrate": cfg["bitrate"],
+                "mic_url": cfg.get("mic_url") or None,
+                "capabilities": {"speaker": True,
+                                 "intercom": bool(cfg.get("intercom", True)) and INTERCOM_AVAILABLE,
+                                 "ptz": bool(cfg.get("ptz_enabled")),
+                                 "assist_mic": bool(cfg.get("mic_url"))},
+                "ptz_protocol": cfg.get("ptz_protocol", "none"),
+                "ptz_speed": cfg.get("ptz_speed", 50),
                 "state": media_state,
                 "queued": worker.queue.qsize(),
                 "current_job": worker.current_job,
@@ -1283,7 +1381,7 @@ def cameras_view():
                 "sender": worker.sender.status(),
             }
         )
-    return jsonify({"version": APP_VERSION, "features": ["queue_modes", "runtime_gain", "voice_reopen_guard"], "cameras": result})
+    return jsonify({"version": APP_VERSION, "features": ["queue_modes", "runtime_gain", "voice_reopen_guard", "multi_vendor", "ptz", "audio_upload", "assist_mic", "intercom_exec"], "cameras": result})
 
 
 @app.patch("/cameras/<camera_id>/settings")
@@ -1407,6 +1505,87 @@ def media():
 def media_camera(camera_id: str):
     data = request.get_json(silent=True) or {}
     return handle_media(camera_id, data)
+
+
+@app.get("/cameras/<camera_id>/intercom-source")
+def intercom_source(camera_id: str):
+    if not require_auth():
+        return auth_error()
+    cfg = CAMERAS.get(camera_id)
+    if cfg is None:
+        return jsonify({"error": f"unknown camera: {camera_id}"}), 404
+    if not cfg.get("intercom", True):
+        return jsonify({"error": "intercom is disabled for this camera"}), 409
+    if not INTERCOM_AVAILABLE:
+        return jsonify({"error": f"intercom server is unavailable on port {INTERCOM_PORT}"}), 503
+    token = intercom_token(SETTINGS.api_key, camera_id, str(cfg.get("intercom_key") or ""))
+    host = urlparse(request.host_url).hostname or "127.0.0.1"
+    override = str(request.args.get("host") or "").strip()
+    try:
+        host = _safe_intercom_host(override or host)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    url = f"http://{host}:{INTERCOM_PORT}/intercom/{camera_id}/{token}"
+    source = (f"exec:ffmpeg -hide_banner -loglevel error -fflags nobuffer "
+              f"-f alaw -ar 8000 -ac 1 -i - -c:a copy -f alaw -flush_packets 1 "
+              f"-method POST {url}#backchannel=1#audio=alaw/8000")
+    return jsonify({"camera": camera_id, "source": source, "port": INTERCOM_PORT, "codec": "PCMA/8000"})
+
+
+def enqueue_uploaded_audio(camera_id: str, content: bytes, data: dict[str, Any]) -> list[dict[str, Any]]:
+    if camera_id not in CAMERAS:
+        raise ConfigError(f"unknown camera: {camera_id}")
+    if not content:
+        raise ValueError("audio body is empty")
+    queue_mode = normalize_queue_mode(data, default="replace")
+    title = str(data.get("title") or "Assist audio")[:240]
+    worker = WORKERS[camera_id]
+    with worker.action_lock:
+        _prepare_queue_mode([camera_id], queue_mode)
+        if worker.queue.full():
+            raise OverflowError(f"queue full for camera: {camera_id}")
+        job = new_job(camera_id, kind="media", title=title)
+        spec = uploaded_audio_spec(CAMERAS[camera_id], content, data)
+        key = "upload:" + uploaded_audio_key(spec)
+        future = _submit_singleflight(key, prepare_uploaded_audio, spec)
+        worker.enqueue({"job_id": job["id"], "future": future, "kind": "audio",
+                        "prep_timeout": SETTINGS.prep_timeout, "send_timeout": SETTINGS.send_timeout},
+                       next_item=queue_mode in {"next", "play", "replace"})
+    return [job_snapshot(job["id"]) or job]
+
+
+@app.post("/audio/<camera_id>")
+def audio_camera(camera_id: str):
+    if not require_auth():
+        return auth_error()
+    try:
+        data = {"queue_mode": request.args.get("queue_mode", "replace"),
+                "title": request.args.get("title", "Assist audio")}
+        result = enqueue_uploaded_audio(camera_id, request.get_data(cache=False), data)
+    except (ConfigError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    except OverflowError as exc:
+        return jsonify({"error": str(exc)}), 429
+    return jsonify({"status": "queued", "jobs": result}), 202
+
+
+@app.post("/ptz/<camera_id>")
+def ptz_camera(camera_id: str):
+    if not require_auth():
+        return auth_error()
+    if camera_id not in CAMERAS:
+        return jsonify({"error": f"unknown camera: {camera_id}"}), 404
+    data = request.get_json(silent=True) or {}
+    direction = str(data.get("direction") or "").strip().lower()
+    if direction not in {"left", "right", "up", "down", "up_left", "up_right", "down_left", "down_right", "zoom_in", "zoom_out"}:
+        return jsonify({"error": "invalid PTZ direction"}), 400
+    try:
+        speed = parse_float(data.get("speed"), "speed", float(CAMERAS[camera_id].get("ptz_speed", 4)), 1.0, 100.0)
+        duration = parse_float(data.get("duration"), "duration", 0.35, 0.05, 10.0)
+        ptz_move(CAMERAS[camera_id], direction, speed=int(speed), duration=duration)
+    except (ConfigError, PTZError, OSError) as exc:
+        return jsonify({"error": str(exc)}), 502
+    return jsonify({"status": "ok", "camera": camera_id, "direction": direction, "speed": int(speed), "duration": duration})
 
 
 @app.post("/stop/<camera_id>")
