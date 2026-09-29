@@ -43,7 +43,17 @@ class VendorConfigTests(unittest.TestCase):
         cameras, _ = load_cameras(settings, env)
         self.assertEqual(cameras["gate"]["vendor"], "ezviz")
         self.assertEqual(cameras["gate"]["port"], 8000)
+        self.assertEqual(cameras["gate"]["ptz_protocol"], "hcnetsdk")
+
+
+    def test_ezviz_can_force_isapi_fallback(self):
+        env = self.base_env() | {
+            "CAMERAS_JSON": '{"gate":{"vendors":"ezviz","ip":"10.0.0.21","user":"admin","password":"pw","ptz":true,"ptz_protocol":"isapi"}}'
+        }
+        settings = load_settings(env)
+        cameras, _ = load_cameras(settings, env)
         self.assertEqual(cameras["gate"]["ptz_protocol"], "isapi")
+        self.assertEqual(cameras["gate"]["ptz_channel"], 1)
 
     def test_empty_vendor_falls_back_to_vendors(self):
         env = self.base_env() | {
@@ -110,6 +120,14 @@ class PTZTests(unittest.TestCase):
         stop_xml = session.request.call_args_list[1].kwargs["data"].decode()
         self.assertIn("<zoom>60</zoom>", first_xml)
         self.assertIn("<zoom>0</zoom>", stop_xml)
+
+
+    @patch("ptz._hcnetsdk")
+    def test_hcnetsdk_ptz_uses_lazy_local_worker(self, hcnetsdk):
+        cfg = self.cfg("hcnetsdk")
+        cfg["ptz_channel"] = 0
+        ptz_move(cfg, "down", speed=55, duration=0.2)
+        hcnetsdk.assert_called_once_with(cfg, "down", 55, 0.2)
 
     def test_disabled_ptz_fails_without_network(self):
         cfg = self.cfg("dahua")

@@ -27,7 +27,7 @@ from ptz import PTZError, ptz_move
 from intercom_server import IntercomServer, intercom_token
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2.5.0")
+APP_VERSION = os.environ.get("APP_VERSION", "2.5.1")
 _INTERCOM_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _INTERCOM_IPV6_RE = re.compile(r"^[0-9A-Fa-f:]+$")
 

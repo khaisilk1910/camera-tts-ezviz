@@ -214,10 +214,14 @@ def _normalize_camera(raw: Mapping[str, Any], camera_id: str, settings: Settings
     default_sample_rate = settings.tts_sample_rate if vendor == "ezviz" else 16000
     ptz_enabled = parse_bool(raw.get("ptz", raw.get("ptz_enabled")), False)
     ptz_protocol = str(raw.get("ptz_protocol", "auto")).strip().lower() or "auto"
-    if ptz_protocol not in {"auto", "dahua", "isapi", "none"}:
-        raise ConfigError(f"camera {camera_id}: ptz_protocol must be auto, dahua, isapi or none")
+    if ptz_protocol not in {"auto", "dahua", "hcnetsdk", "isapi", "none"}:
+        raise ConfigError(
+            f"camera {camera_id}: ptz_protocol must be auto, dahua, hcnetsdk, isapi or none"
+        )
     if ptz_protocol == "auto":
-        ptz_protocol = "dahua" if vendor in {"imou", "dahua"} else "isapi"
+        # EZVIZ/Hikvision firmware frequently exposes HCNetSDK even when the
+        # optional ISAPI web endpoint is absent. Use the local SDK by default.
+        ptz_protocol = "dahua" if vendor in {"imou", "dahua"} else "hcnetsdk"
     if not ptz_enabled:
         ptz_protocol = "none"
 
@@ -244,7 +248,10 @@ def _normalize_camera(raw: Mapping[str, Any], camera_id: str, settings: Settings
         "ptz_enabled": ptz_enabled,
         "ptz_protocol": ptz_protocol,
         "ptz_port": parse_int(raw.get("ptz_port"), f"camera {camera_id} ptz_port", 80, 1, 65535),
-        "ptz_channel": parse_int(raw.get("ptz_channel"), f"camera {camera_id} ptz_channel", 1 if ptz_protocol == "isapi" else 0, 0, 64),
+        "ptz_channel": parse_int(
+            raw.get("ptz_channel"), f"camera {camera_id} ptz_channel",
+            1 if ptz_protocol == "isapi" else 0, 0, 64
+        ),
         "ptz_speed": parse_int(raw.get("ptz_speed"), f"camera {camera_id} ptz_speed", 50, 1, 100),
         "intercom": parse_bool(raw.get("intercom"), True),
         "intercom_key": str(raw.get("intercom_key", "")).strip(),

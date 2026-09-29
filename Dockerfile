@@ -18,11 +18,19 @@ RUN test -f /opt/hcnetsdk/incEn/HCNetSDK.h \
        -L/opt/hcnetsdk/lib \
        -Wl,-rpath,/opt/hcnetsdk/lib \
        -lhcnetsdk \
-       -o /build/send_aac
+       -o /build/send_aac \
+    && g++ -std=c++17 -O2 -Wall -Wextra \
+       /build/src/ptz_hcnetsdk.cpp \
+       -I/opt/hcnetsdk/incEn \
+       -I/build/src \
+       -L/opt/hcnetsdk/lib \
+       -Wl,-rpath,/opt/hcnetsdk/lib \
+       -lhcnetsdk \
+       -o /build/ptz_hcnetsdk
 
 FROM ubuntu:22.04
 
-ARG APP_VERSION=2.5.0
+ARG APP_VERSION=2.5.1
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -43,11 +51,13 @@ RUN pip3 install --no-cache-dir -r /tmp/requirements.txt \
 
 COPY hcnetsdk/ /opt/hcnetsdk/
 COPY --from=builder /build/send_aac /usr/local/bin/send_aac
+COPY --from=builder /build/ptz_hcnetsdk /usr/local/bin/ptz_hcnetsdk
 COPY app/ /app/
 
-RUN chmod 0755 /usr/local/bin/send_aac \
+RUN chmod 0755 /usr/local/bin/send_aac /usr/local/bin/ptz_hcnetsdk \
     && mkdir -p /cache \
     && test -x /usr/local/bin/send_aac \
+    && test -x /usr/local/bin/ptz_hcnetsdk \
     && test -f /opt/hcnetsdk/lib/libhcnetsdk.so \
     && test -f /opt/hcnetsdk/lib/HCNetSDKCom/libHCVoiceTalk.so \
     && python3 -m py_compile /app/config.py /app/queueing.py /app/vendor_talk.py /app/ptz.py /app/intercom_server.py /app/server.py
