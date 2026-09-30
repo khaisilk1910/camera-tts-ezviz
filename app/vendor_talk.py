@@ -538,11 +538,12 @@ class ImouDahuaSender:
                 finally:
                     self.active_session = None
 
-    def play_stream_pcm(self, chunks, *, input_rate: int = 8000) -> dict[str, Any]:
+    def play_stream_pcm(self, chunks, *, input_rate: int = 8000, clear_stop: bool = True) -> dict[str, Any]:
         """Play a live PCM16 mono stream, serialized with TTS/media for this camera."""
         started = time.monotonic()
         with self.command_lock:
-            self.stop_requested.clear()
+            if clear_stop:
+                self.stop_requested.clear()
             session = self.factory.open()
             self.active_session = session
             try:

@@ -109,6 +109,43 @@ class ServerQueueRaceTests(unittest.TestCase):
         finally:
             server.job_snapshot, server.update_job = old_snapshot, old_update
 
+    def test_stop_during_stream_buffering_kills_ffmpeg_source(self):
+        server = self.server
+        worker = self._make_worker_for_stop_test("preparing")
+
+        class Stream:
+            def __init__(self):
+                self.stop_calls = 0
+
+            def stop(self):
+                self.stop_calls += 1
+
+        stream = Stream()
+        worker.active_media_stream = stream
+        old_snapshot, old_update = server.job_snapshot, server.update_job
+        try:
+            server.job_snapshot = lambda _job_id: {"status": "preparing"}
+            server.update_job = lambda *_args, **_kwargs: None
+            self.assertEqual(worker.stop(clear_queue=True), 1)
+            self.assertEqual(stream.stop_calls, 1)
+            self.assertEqual(worker.sender.stop_calls, 0)
+            self.assertIn("job", worker.cancelled_jobs)
+        finally:
+            server.job_snapshot, server.update_job = old_snapshot, old_update
+
+    def test_stream_software_volume_is_live(self):
+        server = self.server
+        worker = object.__new__(server.CameraWorker)
+        worker.cfg = {"volume_level": 0.5, "hardware_volume_active": False}
+        raw = (10000).to_bytes(2, "little", signed=True) * 2
+        out = list(worker._stream_chunks_with_live_volume(iter([raw])))
+        self.assertEqual(int.from_bytes(out[0][:2], "little", signed=True), 5000)
+        worker.cfg["volume_level"] = 0.25
+        out = list(worker._stream_chunks_with_live_volume(iter([raw])))
+        self.assertEqual(int.from_bytes(out[0][:2], "little", signed=True), 2500)
+        worker.cfg["hardware_volume_active"] = True
+        self.assertEqual(list(worker._stream_chunks_with_live_volume(iter([raw])))[0], raw)
+
     def test_stop_during_play_terminates_sender(self):
         server = self.server
         worker = self._make_worker_for_stop_test("playing")

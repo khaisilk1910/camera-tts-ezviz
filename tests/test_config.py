@@ -78,6 +78,24 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(default_camera, "")
         self.assertEqual(cameras["yard"]["gain_db"], 3.0)
 
+    def test_camera_volume_level_is_normalized(self):
+        env = self.base_env()
+        env["CAMERAS_JSON"] = json.dumps([
+            {"id": "gate", "ip": "10.0.0.10", "user": "admin", "password": "a", "volume_level": 0.42},
+        ])
+        settings = load_settings(env)
+        cameras, _ = load_cameras(settings, env)
+        self.assertAlmostEqual(cameras["gate"]["volume_level"], 0.42)
+
+    def test_invalid_camera_volume_level_is_rejected(self):
+        env = self.base_env()
+        env["CAMERAS_JSON"] = json.dumps([
+            {"id": "gate", "ip": "10.0.0.10", "user": "admin", "password": "a", "volume_level": 1.5},
+        ])
+        settings = load_settings(env)
+        with self.assertRaises(ConfigError):
+            load_cameras(settings, env)
+
     def test_duplicate_target_is_rejected(self):
         env = self.base_env() | {
             "CAMERA_01_ENABLED": "true",

@@ -242,6 +242,7 @@ def _normalize_camera(raw: Mapping[str, Any], camera_id: str, settings: Settings
         "rate": rate,
         "edge_volume": edge_volume,
         "gain_db": parse_float(raw.get("gain_db"), f"camera {camera_id} gain_db", settings.tts_gain_db, -20.0, 12.0),
+        "volume_level": parse_float(raw.get("volume_level"), f"camera {camera_id} volume_level", 1.0, 0.0, 1.0),
         "sample_rate": parse_int(raw.get("sample_rate"), f"camera {camera_id} sample_rate", default_sample_rate, 8000, 48000),
         "bitrate": validate_bitrate(str(raw.get("bitrate", settings.tts_bitrate)), f"camera {camera_id} bitrate"),
         "mic_url": mic_url,

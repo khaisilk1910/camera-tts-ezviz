@@ -2,16 +2,18 @@
 from __future__ import annotations
 
 import hashlib
+from array import array
 import hmac
 import json
 import os
 import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
@@ -27,7 +29,7 @@ from ptz import PTZError, ptz_move
 from intercom_server import IntercomServer, intercom_token
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2.5.1")
+APP_VERSION = os.environ.get("APP_VERSION", "2.6.0")
 _INTERCOM_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _INTERCOM_IPV6_RE = re.compile(r"^[0-9A-Fa-f:]+$")
 
@@ -87,6 +89,8 @@ PRECACHE_TEXTS_JSON = os.environ.get("PRECACHE_TEXTS_JSON", "").strip()
 MEDIA_PREP_TIMEOUT = max(30, min(int(os.environ.get("MEDIA_PREP_TIMEOUT", "900")), 7200))
 MEDIA_SEND_TIMEOUT = max(60, min(int(os.environ.get("MEDIA_SEND_TIMEOUT", "7200")), 21600))
 MEDIA_MAX_URL_LENGTH = max(256, min(int(os.environ.get("MEDIA_MAX_URL_LENGTH", "4096")), 16384))
+MEDIA_STREAMING = os.environ.get("MEDIA_STREAMING", "true").strip().lower() in {"1", "true", "yes", "on"}
+MEDIA_STREAM_CHUNK = max(1024, min(int(os.environ.get("MEDIA_STREAM_CHUNK", "8192")), 65536))
 LOG_SUCCESSFUL_JOBS = os.environ.get("LOG_SUCCESSFUL_JOBS", "false").strip().lower() in {"1", "true", "yes", "on"}
 INTERCOM_PORT = max(1024, min(int(os.environ.get("INTERCOM_PORT", "8125")), 65535))
 
@@ -98,6 +102,7 @@ except ConfigError as exc:
     CONFIG_ERROR = str(exc)
 
 BASE_CAMERA_GAINS = {camera_id: float(cfg["gain_db"]) for camera_id, cfg in CAMERAS.items()}
+BASE_CAMERA_VOLUMES = {camera_id: float(cfg.get("volume_level", 1.0)) for camera_id, cfg in CAMERAS.items()}
 RUNTIME_SETTINGS = _load_runtime_settings()
 for _camera_id, _overrides in list(RUNTIME_SETTINGS.items()):
     if _camera_id not in CAMERAS:
@@ -107,6 +112,11 @@ for _camera_id, _overrides in list(RUNTIME_SETTINGS.items()):
             CAMERAS[_camera_id]["gain_db"] = parse_float(
                 _overrides["gain_db"], f"runtime gain_db for {_camera_id}",
                 float(CAMERAS[_camera_id]["gain_db"]), -20.0, 12.0
+            )
+        if "volume_level" in _overrides:
+            CAMERAS[_camera_id]["volume_level"] = parse_float(
+                _overrides["volume_level"], f"runtime volume_level for {_camera_id}",
+                float(CAMERAS[_camera_id].get("volume_level", 1.0)), 0.0, 1.0
             )
     except ConfigError:
         RUNTIME_SETTINGS.pop(_camera_id, None)
@@ -300,11 +310,19 @@ except Exception as exc:
 threading.Thread(target=cache_maintenance_loop, daemon=True, name="cache-maintenance").start()
 
 
+def _software_volume_level(camera_cfg: dict[str, Any]) -> float:
+    """Return DSP volume only when hardware speaker volume is unavailable."""
+    if camera_cfg.get("hardware_volume_active"):
+        return 1.0
+    return max(0.0, min(float(camera_cfg.get("volume_level", 1.0)), 1.0))
+
+
 def audio_spec(camera_cfg: dict[str, Any], text: str, data: dict[str, Any]) -> dict[str, Any]:
     voice = str(camera_cfg.get("voice") or SETTINGS.tts_voice)
     rate = str(camera_cfg.get("rate") or SETTINGS.tts_rate)
     edge_volume = str(camera_cfg.get("edge_volume") or SETTINGS.tts_edge_volume)
     gain_db = float(camera_cfg.get("gain_db", SETTINGS.tts_gain_db))
+    volume_level = _software_volume_level(camera_cfg)
 
     if SETTINGS.allow_request_overrides:
         if data.get("voice") not in (None, ""):
@@ -322,6 +340,7 @@ def audio_spec(camera_cfg: dict[str, Any], text: str, data: dict[str, Any]) -> d
         "rate": rate,
         "edge_volume": edge_volume,
         "gain_db": gain_db,
+        "volume_level": volume_level,
         "sample_rate": int(camera_cfg.get("sample_rate", SETTINGS.tts_sample_rate)),
         "bitrate": str(camera_cfg.get("bitrate", SETTINGS.tts_bitrate)),
         "vendor": str(camera_cfg.get("vendor", "ezviz")),
@@ -341,6 +360,7 @@ def audio_keys(spec: dict[str, Any]) -> tuple[str, str]:
     aac_spec = {
         "base": base_key,
         "gain_db": float(spec["gain_db"]),
+        "volume_level": float(spec.get("volume_level", 1.0)),
         "sample_rate": int(spec["sample_rate"]),
         "bitrate": str(spec["bitrate"]),
         "vendor": str(spec.get("vendor", "ezviz")),
@@ -414,7 +434,7 @@ def prepare_audio(spec: dict[str, Any]) -> dict[str, Any]:
         tmp_final = final_path.with_name(f".{final_path.stem}.{uuid.uuid4().hex}{final_path.suffix}")
         try:
             gain_db = max(-20.0, min(float(spec["gain_db"]), 12.0))
-            audio_filter = f"volume={gain_db}dB,alimiter=limit=0.97"
+            audio_filter = f"volume={gain_db}dB,volume={float(spec.get('volume_level', 1.0)):.4f},alimiter=limit=0.97"
             cmd = [SETTINGS.ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(base_mp3),
                    "-vn", "-ac", "1", "-ar", str(spec["sample_rate"]), "-af", audio_filter,
                    *_ffmpeg_output_args(spec, tmp_final)]
@@ -475,6 +495,7 @@ def media_spec(camera_cfg: dict[str, Any], media_url: str, data: dict[str, Any])
         raise ValueError("media URL must be an absolute http:// or https:// URL")
 
     gain_db = float(camera_cfg.get("gain_db", SETTINGS.tts_gain_db))
+    volume_level = _software_volume_level(camera_cfg)
     if SETTINGS.allow_request_overrides and data.get("gain_db") not in (None, ""):
         gain_db = parse_float(data["gain_db"], "gain_db", gain_db, -20.0, 12.0)
 
@@ -485,6 +506,7 @@ def media_spec(camera_cfg: dict[str, Any], media_url: str, data: dict[str, Any])
         "cache_identity": cache_identity,
         "title": title[:240],
         "gain_db": gain_db,
+        "volume_level": volume_level,
         "sample_rate": int(camera_cfg.get("sample_rate", SETTINGS.tts_sample_rate)),
         "bitrate": str(camera_cfg.get("bitrate", SETTINGS.tts_bitrate)),
         "vendor": str(camera_cfg.get("vendor", "ezviz")),
@@ -496,6 +518,7 @@ def media_key(spec: dict[str, Any]) -> str:
         {
             "source": spec["cache_identity"],
             "gain_db": float(spec["gain_db"]),
+            "volume_level": float(spec.get("volume_level", 1.0)),
             "sample_rate": int(spec["sample_rate"]),
             "bitrate": str(spec["bitrate"]),
             "vendor": str(spec.get("vendor", "ezviz")),
@@ -528,7 +551,7 @@ def prepare_media(spec: dict[str, Any]) -> dict[str, Any]:
         tmp_final = final_path.with_name(f".{final_path.stem}.{uuid.uuid4().hex}{final_path.suffix}")
         try:
             gain_db = max(-20.0, min(float(spec["gain_db"]), 12.0))
-            audio_filter = f"volume={gain_db}dB,alimiter=limit=0.97"
+            audio_filter = f"volume={gain_db}dB,volume={float(spec.get('volume_level', 1.0)):.4f},alimiter=limit=0.97"
             cmd = [SETTINGS.ffmpeg, "-nostdin", "-y", "-hide_banner", "-loglevel", "error", "-i", spec["url"],
                    "-vn", "-ac", "1", "-ar", str(spec["sample_rate"]), "-af", audio_filter,
                    *_ffmpeg_output_args(spec, tmp_final)]
@@ -553,13 +576,13 @@ def uploaded_audio_spec(camera_cfg: dict[str, Any], content: bytes, data: dict[s
     if data.get("gain_db") not in (None, "") and SETTINGS.allow_request_overrides:
         gain_db = parse_float(data["gain_db"], "gain_db", gain_db, -20.0, 12.0)
     return {"content": content, "content_hash": hashlib.sha256(content).hexdigest(),
-            "gain_db": gain_db, "sample_rate": int(camera_cfg.get("sample_rate", SETTINGS.tts_sample_rate)),
+            "gain_db": gain_db, "volume_level": _software_volume_level(camera_cfg), "sample_rate": int(camera_cfg.get("sample_rate", SETTINGS.tts_sample_rate)),
             "bitrate": str(camera_cfg.get("bitrate", SETTINGS.tts_bitrate)),
             "vendor": str(camera_cfg.get("vendor", "ezviz"))}
 
 
 def uploaded_audio_key(spec: dict[str, Any]) -> str:
-    raw = json.dumps({k: spec[k] for k in ("content_hash", "gain_db", "sample_rate", "bitrate", "vendor")},
+    raw = json.dumps({k: spec[k] for k in ("content_hash", "gain_db", "volume_level", "sample_rate", "bitrate", "vendor")},
                      sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -578,7 +601,7 @@ def prepare_uploaded_audio(spec: dict[str, Any]) -> dict[str, Any]:
             return {"path": str(final_path), "cache": "upload-hit-after-wait",
                     "prepare_ms": round((time.monotonic()-started)*1000, 1)}
         tmp_final = final_path.with_name(f".{final_path.stem}.{uuid.uuid4().hex}{final_path.suffix}")
-        gain_db=max(-20.0,min(float(spec["gain_db"]),12.0)); audio_filter=f"volume={gain_db}dB,alimiter=limit=0.97"
+        gain_db=max(-20.0,min(float(spec["gain_db"]),12.0)); audio_filter=f"volume={gain_db}dB,volume={float(spec.get('volume_level', 1.0)):.4f},alimiter=limit=0.97"
         cmd=[SETTINGS.ffmpeg,"-y","-hide_banner","-loglevel","error","-i","pipe:0","-vn","-ac","1",
              "-ar",str(spec["sample_rate"]),"-af",audio_filter,*_ffmpeg_output_args(spec,tmp_final)]
         try:
@@ -600,6 +623,125 @@ def get_media_future(spec: dict[str, Any]) -> Future:
     return _submit_singleflight(key, prepare_media, spec)
 
 
+class StreamingMediaSource:
+    """Incrementally transcode a media URL to paced PCM so playback starts quickly."""
+
+    def __init__(self, spec: dict[str, Any]) -> None:
+        self.spec = spec
+        self.proc: subprocess.Popen[bytes] | None = None
+        self._stderr_tail = bytearray()
+        self._stderr_lock = threading.Lock()
+        self._stderr_thread: threading.Thread | None = None
+        self._stop_requested = threading.Event()
+        self._proc_lock = threading.Lock()
+
+    def _drain_stderr(self, proc: subprocess.Popen[bytes]) -> None:
+        if proc.stderr is None:
+            return
+        try:
+            while True:
+                chunk = proc.stderr.read(2048)
+                if not chunk:
+                    return
+                with self._stderr_lock:
+                    self._stderr_tail.extend(chunk)
+                    if len(self._stderr_tail) > 8192:
+                        del self._stderr_tail[:-8192]
+        except OSError:
+            return
+
+    def _error_text(self) -> str:
+        with self._stderr_lock:
+            return bytes(self._stderr_tail).decode(errors="replace").strip()[-1200:]
+
+    def start(self) -> None:
+        if self._stop_requested.is_set():
+            raise PlaybackStopped("playback stopped")
+        with self._proc_lock:
+            if self.proc is not None:
+                return
+            if self._stop_requested.is_set():
+                raise PlaybackStopped("playback stopped")
+        gain_db = max(-20.0, min(float(self.spec["gain_db"]), 12.0))
+        # Streaming volume is applied dynamically in CameraWorker so a Home
+        # Assistant slider move can affect an already-playing long track when
+        # hardware volume control is unavailable. Gain remains a static DSP
+        # calibration setting and is intentionally separate from media volume.
+        audio_filter = f"volume={gain_db}dB,alimiter=limit=0.97"
+        cmd = [SETTINGS.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error"]
+        parsed = urlparse(str(self.spec["url"]))
+        if parsed.scheme.lower() in {"http", "https"}:
+            cmd += [
+                "-rw_timeout", "15000000",
+                "-reconnect", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "2",
+            ]
+        # -re prevents file/HTTP sources from being pushed faster than real time
+        # into the camera VoiceTalk path. It also keeps memory use bounded.
+        cmd += [
+            "-re", "-i", str(self.spec["url"]),
+            "-vn", "-ac", "1", "-ar", str(self.spec["sample_rate"]),
+            "-af", audio_filter, "-f", "s16le", "pipe:1",
+        ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with self._proc_lock:
+            if self._stop_requested.is_set():
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                raise PlaybackStopped("playback stopped")
+            self.proc = proc
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr, args=(proc,), daemon=True, name="media-ffmpeg-stderr"
+        )
+        self._stderr_thread.start()
+
+    def first_chunk(self) -> bytes:
+        self.start()
+        proc = self.proc
+        assert proc is not None and proc.stdout is not None
+        chunk = proc.stdout.read(MEDIA_STREAM_CHUNK)
+        if chunk:
+            return chunk
+        rc = proc.poll()
+        detail = self._error_text()
+        raise RuntimeError(
+            detail or f"ffmpeg media stream ended before audio became available (rc={rc})"
+        )
+
+    def chunks(self, first: bytes):
+        proc = self.proc
+        assert proc is not None and proc.stdout is not None
+        yield first
+        while True:
+            chunk = proc.stdout.read(MEDIA_STREAM_CHUNK)
+            if not chunk:
+                break
+            yield chunk
+        rc = proc.wait(timeout=3)
+        if rc != 0:
+            raise RuntimeError(self._error_text() or f"ffmpeg media stream failed (rc={rc})")
+
+    def stop(self) -> None:
+        self._stop_requested.set()
+        with self._proc_lock:
+            proc = self.proc
+            self.proc = None
+        if proc is None:
+            return
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+
 class PlaybackStopped(RuntimeError):
     pass
 
@@ -615,6 +757,8 @@ class PersistentCameraSender:
         self.last_ready_at: float | None = None
         self.last_user_id: int | None = None
         self.last_forced_stop_at: float | None = None
+        self.speaker_volume: int | None = None
+        self.volume_supported: bool | None = None
         self.stop_requested = threading.Event()
         threading.Thread(target=self._warm_start, daemon=True, name=f"sdk-warm-{camera_id}").start()
 
@@ -646,6 +790,12 @@ class PersistentCameraSender:
         try:
             with self.command_lock:
                 self._ensure_started()
+                try:
+                    self._refresh_volume_locked()
+                except Exception as exc:
+                    self.volume_supported = False
+                    self.cfg["hardware_volume_active"] = False
+                    log(f"[{self.camera_id}] hardware speaker volume unavailable; using software volume: {exc}")
         except Exception as exc:
             self.last_error = str(exc)
             log(f"[{self.camera_id}] SDK warm start deferred: {exc}")
@@ -750,6 +900,44 @@ class PersistentCameraSender:
         self.last_ready_at = time.time()
         log(f"[{self.camera_id}] persistent HCNetSDK worker ready ({line})")
 
+    def _refresh_volume_locked(self) -> int:
+        self._ensure_started()
+        proc = self.proc
+        if proc is None or proc.stdin is None:
+            raise RuntimeError("HCNetSDK worker is unavailable")
+        proc.stdin.write("GET_VOLUME\n")
+        proc.stdin.flush()
+        line = self._next_response(proc, SENDER_START_TIMEOUT)
+        if not line.startswith("VOLUME\t"):
+            raise RuntimeError(line)
+        value = max(0, min(100, int(line.split("\t", 1)[1])))
+        self.speaker_volume = value
+        self.volume_supported = True
+        self.cfg["volume_level"] = value / 100.0
+        self.cfg["hardware_volume_active"] = True
+        return value
+
+    def set_volume_level(self, level: float) -> dict[str, Any]:
+        """Set hardware speaker volume with a short independent local SDK call."""
+        level = max(0.0, min(float(level), 1.0))
+        value = int(round(level * 100.0))
+        try:
+            completed = subprocess.run(
+                [SETTINGS.send_aac, "--set-volume", str(value)],
+                env=self._env(), capture_output=True, text=True, timeout=SENDER_START_TIMEOUT + 4, check=True,
+            )
+            match = re.search(r"VOLUME=(\d+)", completed.stdout or "")
+            actual = max(0, min(100, int(match.group(1)))) if match else value
+            self.speaker_volume = actual
+            self.volume_supported = True
+            self.cfg["volume_level"] = actual / 100.0
+            self.cfg["hardware_volume_active"] = True
+            return {"volume_level": actual / 100.0, "volume_backend": "hcnetsdk"}
+        except (subprocess.SubprocessError, OSError, ValueError) as exc:
+            self.volume_supported = False
+            self.cfg["hardware_volume_active"] = False
+            raise RuntimeError(f"hardware speaker volume failed: {exc}") from exc
+
     def _wait_after_forced_stop(self) -> None:
         if self.last_forced_stop_at is None or VOICE_REOPEN_GUARD_MS <= 0:
             return
@@ -825,11 +1013,12 @@ class PersistentCameraSender:
 
         raise RuntimeError(self.last_error or "HCNetSDK playback failed")
 
-    def play_stream_pcm(self, chunks, *, input_rate: int = 8000) -> dict[str, Any]:
+    def play_stream_pcm(self, chunks, *, input_rate: int = 8000, clear_stop: bool = True) -> dict[str, Any]:
         """Encode a live PCM16 stream to AAC and keep one HCNetSDK VoiceTalk open."""
         started = time.monotonic()
         with self.command_lock:
-            self.stop_requested.clear()
+            if clear_stop:
+                self.stop_requested.clear()
             self._wait_after_forced_stop()
             self._ensure_started()
             proc = self.proc
@@ -936,7 +1125,29 @@ class PersistentCameraSender:
             "last_error": self.last_error,
             "ready_at": self.last_ready_at,
             "connected": alive and self.last_user_id is not None and self.last_user_id >= 0,
+            "volume_level": (self.speaker_volume / 100.0) if self.speaker_volume is not None else None,
+            "volume_supported": self.volume_supported,
         }
+
+
+def _scale_pcm16le(pcm: bytes, level: float) -> bytes:
+    """Scale signed little-endian PCM16 without clipping or extra dependencies."""
+    factor = max(0.0, min(float(level), 1.0))
+    if not pcm or factor >= 0.9999:
+        return pcm
+    if factor <= 0.0001:
+        return b"\x00" * len(pcm)
+    usable = len(pcm) & ~1
+    samples = array("h")
+    samples.frombytes(pcm[:usable])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    for index, sample in enumerate(samples):
+        samples[index] = int(sample * factor)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    scaled = samples.tobytes()
+    return scaled + pcm[usable:]
 
 
 class CameraWorker:
@@ -950,6 +1161,7 @@ class CameraWorker:
         # Serialize stop/queue-mode/enqueue operations per camera. This avoids
         # REPLACE/PLAY races without blocking unrelated cameras.
         self.action_lock = threading.Lock()
+        self.active_media_stream: StreamingMediaSource | None = None
         self.sender = (PersistentCameraSender(camera_id, cfg) if cfg.get("vendor", "ezviz") == "ezviz" else ImouDahuaSender(camera_id, cfg, ffmpeg=SETTINGS.ffmpeg))
         self.thread = threading.Thread(target=self.run, daemon=True, name=f"camera-{camera_id}")
         self.thread.start()
@@ -969,9 +1181,13 @@ class CameraWorker:
             with self.cancel_lock:
                 self.cancelled_jobs.add(current_job)
             update_job(current_job, status="stopping")
-            # Do not restart an idle persistent HCNetSDK worker just because a
-            # preparation-stage item was cancelled. Once status is playing, the
-            # sender may already own VoiceTalk and must be terminated promptly.
+            # Kill URL transcoding even while the item is still buffering. This
+            # makes STOP responsive instead of waiting for a long ffmpeg probe/download.
+            stream = getattr(self, "active_media_stream", None)
+            if stream is not None:
+                stream.stop()
+            # Once status is playing, the sender may already own VoiceTalk and
+            # must be terminated promptly to release the camera speaker.
             if current.get("status") == "playing":
                 self.sender.stop_current()
             stopped += 1
@@ -992,11 +1208,34 @@ class CameraWorker:
             if self.current_job == job_id:
                 self.current_job = None
 
+    def _stream_chunks_with_live_volume(self, chunks):
+        """Apply current software media volume to each PCM chunk while streaming."""
+        for chunk in chunks:
+            if not chunk:
+                continue
+            if self.cfg.get("hardware_volume_active"):
+                yield chunk
+            else:
+                yield _scale_pcm16le(chunk, float(self.cfg.get("volume_level", 1.0)))
+
+    def _wait_prepared(self, item: dict[str, Any], job_id: str) -> dict[str, Any]:
+        """Wait for a preparation Future while remaining immediately cancellable."""
+        future = item["future"]
+        timeout = float(item.get("prep_timeout") or SETTINGS.prep_timeout)
+        deadline = time.monotonic() + timeout
+        while True:
+            if self._is_cancelled(job_id):
+                raise PlaybackStopped("playback stopped")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"audio preparation timed out after {timeout:g}s")
+            try:
+                return future.result(timeout=min(0.15, remaining))
+            except FutureTimeout:
+                continue
+
     def run(self) -> None:
         while True:
-            # Wait without holding action_lock, then atomically dequeue and mark
-            # the job current. This closes the tiny REPLACE race between a queue
-            # pop and current_job becoming visible to stop().
             self.queue.wait_for_item()
             with self.action_lock:
                 try:
@@ -1007,38 +1246,55 @@ class CameraWorker:
                 kind = str(item.get("kind") or "unknown")
                 stage = "prepare"
                 self.current_job = job_id
-                # Clear a stop from the previous job only while this new job is
-                # protected by action_lock. A later stop must remain observable.
                 self.sender.stop_requested.clear()
                 update_job(job_id, status="preparing")
                 mark_job_stage(job_id, "prepare_wait_start_ms")
+
+            stream: StreamingMediaSource | None = None
             try:
-                prepared = item["future"].result(
-                    timeout=float(item.get("prep_timeout") or SETTINGS.prep_timeout)
-                )
-                mark_job_stage(job_id, "audio_ready_ms")
-                # Serialize the final cancellation check with stop(). Once this
-                # block publishes status=playing, a concurrent stop knows it
-                # must terminate the HCNetSDK sender; before that it only needs
-                # to cancel preparation.
-                with self.action_lock:
+                if item.get("stream_media"):
+                    stage = "media_stream_open"
+                    stream = StreamingMediaSource(item["spec"])
+                    self.active_media_stream = stream
+                    first = stream.first_chunk()
                     if self._is_cancelled(job_id):
                         raise PlaybackStopped("playback stopped")
-                    update_job(
-                        job_id,
-                        cache=prepared.get("cache"),
-                        base_cache=prepared.get("base_cache"),
-                        prepare_ms=prepared.get("prepare_ms"),
-                        status="playing",
+                    mark_job_stage(job_id, "audio_ready_ms")
+                    with self.action_lock:
+                        if self._is_cancelled(job_id):
+                            raise PlaybackStopped("playback stopped")
+                        update_job(job_id, cache="streaming", prepare_ms=0.0, status="playing")
+                        stage = f"{self.cfg.get('vendor', 'ezviz')}_stream_playback"
+                        mark_job_stage(job_id, "play_start_ms")
+                    play_result = self.sender.play_stream_pcm(
+                        self._stream_chunks_with_live_volume(stream.chunks(first)),
+                        input_rate=int(item["spec"]["sample_rate"]),
+                        clear_stop=False,
                     )
-                    stage = f"{self.cfg.get('vendor', 'ezviz')}_playback"
-                    mark_job_stage(job_id, "play_start_ms")
-                if LOG_SUCCESSFUL_JOBS:
-                    log(
-                        f"[{job_id}] camera={self.camera_id} kind={kind} stage=play "
-                        f"cache={prepared.get('cache')} prepare_ms={prepared.get('prepare_ms')}"
-                    )
-                play_result = self.sender.play(prepared["path"], timeout=item.get("send_timeout"))
+                else:
+                    prepared = self._wait_prepared(item, job_id)
+                    mark_job_stage(job_id, "audio_ready_ms")
+                    with self.action_lock:
+                        if self._is_cancelled(job_id):
+                            raise PlaybackStopped("playback stopped")
+                        update_job(
+                            job_id,
+                            cache=prepared.get("cache"),
+                            base_cache=prepared.get("base_cache"),
+                            prepare_ms=prepared.get("prepare_ms"),
+                            status="playing",
+                        )
+                        stage = f"{self.cfg.get('vendor', 'ezviz')}_playback"
+                        mark_job_stage(job_id, "play_start_ms")
+                    if LOG_SUCCESSFUL_JOBS:
+                        log(
+                            f"[{job_id}] camera={self.camera_id} kind={kind} stage=play "
+                            f"cache={prepared.get('cache')} prepare_ms={prepared.get('prepare_ms')}"
+                        )
+                    play_result = self.sender.play(prepared["path"], timeout=item.get("send_timeout"))
+
+                if self._is_cancelled(job_id):
+                    raise PlaybackStopped("playback stopped")
                 mark_job_stage(job_id, "done_ms")
                 self._finish_current(job_id, status="done", playback=play_result)
                 if LOG_SUCCESSFUL_JOBS:
@@ -1059,13 +1315,20 @@ class CameraWorker:
                     mark_job_stage(job_id, "error_ms")
                     error_type = exc.__class__.__name__
                     error_text = str(exc) or error_type
-                    self._finish_current(job_id, status="error", error=error_text, error_type=error_type, error_stage=stage)
-                    log(f"ERROR job={job_id} camera={self.camera_id} kind={kind} stage={stage} type={error_type} detail={error_text}")
+                    self._finish_current(
+                        job_id, status="error", error=error_text,
+                        error_type=error_type, error_stage=stage,
+                    )
+                    log(
+                        f"ERROR job={job_id} camera={self.camera_id} kind={kind} "
+                        f"stage={stage} type={error_type} detail={error_text}"
+                    )
             finally:
+                if stream is not None:
+                    stream.stop()
+                if self.active_media_stream is stream:
+                    self.active_media_stream = None
                 self._clear_cancelled(job_id)
-                # Terminal paths normally clear current_job via _finish_current.
-                # Keep this guarded fallback for unexpected exceptions while
-                # formatting/logging a terminal result.
                 with self.action_lock:
                     if self.current_job == job_id:
                         self.current_job = None
@@ -1190,7 +1453,7 @@ def enqueue_media_request(camera_value: Any, data: dict[str, Any]) -> list[dict[
         raise ValueError(f"unknown camera(s): {', '.join(unknown)}")
 
     queue_mode = normalize_queue_mode(data, default="replace")
-    staged: list[tuple[CameraWorker, dict[str, Any], Future]] = []
+    staged: list[tuple[CameraWorker, dict[str, Any]]] = []
     per_request_futures: dict[str, Future] = {}
 
     # Same per-camera transaction semantics as TTS: queue-mode + enqueue are
@@ -1205,23 +1468,26 @@ def enqueue_media_request(camera_value: Any, data: dict[str, Any]) -> list[dict[
             worker = WORKERS[camera_id]
             cfg = CAMERAS[camera_id]
             spec = media_spec(cfg, media_url, data)
-            key = media_key(spec)
-            future = per_request_futures.get(key)
-            if future is None:
-                future = get_media_future(spec)
-                per_request_futures[key] = future
             job = new_job(camera_id, kind="media", title=spec["title"])
-            worker.enqueue({
+            item: dict[str, Any] = {
                 "job_id": job["id"],
-                "future": future,
                 "kind": "media",
-                "prep_timeout": MEDIA_PREP_TIMEOUT,
                 "send_timeout": MEDIA_SEND_TIMEOUT,
-            }, next_item=queue_mode in {"next", "play", "replace"})
-            staged.append((worker, job, future))
+            }
+            if MEDIA_STREAMING:
+                item.update({"stream_media": True, "spec": spec})
+            else:
+                key = media_key(spec)
+                future = per_request_futures.get(key)
+                if future is None:
+                    future = get_media_future(spec)
+                    per_request_futures[key] = future
+                item.update({"future": future, "prep_timeout": MEDIA_PREP_TIMEOUT})
+            worker.enqueue(item, next_item=queue_mode in {"next", "play", "replace"})
+            staged.append((worker, job))
 
     snapshots = []
-    for _, job, _ in staged:
+    for _, job in staged:
         snapshot = job_snapshot(job["id"])
         if snapshot is not None:
             snapshots.append(snapshot)
@@ -1363,11 +1629,14 @@ def cameras_view():
                 "voice_chan": cfg["voice_chan"],
                 "voice": cfg["voice"],
                 "gain_db": cfg["gain_db"],
+                "volume_level": float(cfg.get("volume_level", 1.0)),
+                "volume_backend": "hcnetsdk" if cfg.get("hardware_volume_active") else "software",
                 "queue_size": int(cfg.get("queue_size", SETTINGS.queue_size)),
                 "sample_rate": cfg["sample_rate"],
                 "bitrate": cfg["bitrate"],
                 "mic_url": cfg.get("mic_url") or None,
                 "capabilities": {"speaker": True,
+                                 "volume": True,
                                  "intercom": bool(cfg.get("intercom", True)) and INTERCOM_AVAILABLE,
                                  "ptz": bool(cfg.get("ptz_enabled")),
                                  "assist_mic": bool(cfg.get("mic_url"))},
@@ -1381,7 +1650,7 @@ def cameras_view():
                 "sender": worker.sender.status(),
             }
         )
-    return jsonify({"version": APP_VERSION, "features": ["queue_modes", "runtime_gain", "voice_reopen_guard", "multi_vendor", "ptz", "audio_upload", "assist_mic", "intercom_exec"], "cameras": result})
+    return jsonify({"version": APP_VERSION, "features": ["queue_modes", "runtime_gain", "media_volume", "streaming_media", "instant_stop", "voice_reopen_guard", "multi_vendor", "ptz", "audio_upload", "assist_mic", "intercom_exec"], "cameras": result})
 
 
 @app.patch("/cameras/<camera_id>/settings")
@@ -1391,48 +1660,100 @@ def camera_settings(camera_id: str):
     if camera_id not in CAMERAS:
         return jsonify({"error": f"unknown camera: {camera_id}"}), 404
     data = request.get_json(silent=True) or {}
-    allowed = {"gain_db"}
+    allowed = {"gain_db", "volume_level"}
     unknown = sorted(set(data) - allowed)
     if unknown:
         return jsonify({"error": f"unsupported setting(s): {', '.join(unknown)}"}), 400
-    if "gain_db" not in data:
+    if not (set(data) & allowed):
         return jsonify({"error": "no supported setting supplied"}), 400
-    raw_gain = data.get("gain_db")
-    reset = raw_gain is None or (isinstance(raw_gain, str) and raw_gain.strip().lower() in {"default", "reset"})
+
+    cfg = CAMERAS[camera_id]
+    previous_gain = float(cfg["gain_db"])
+    previous_volume = float(cfg.get("volume_level", 1.0))
+    gain_db = previous_gain
+    volume_level = previous_volume
+    reset_gain = False
+    reset_volume = False
+    volume_backend = "hcnetsdk" if cfg.get("hardware_volume_active") else "software"
+    volume_warning: str | None = None
+
     try:
-        gain_db = (
-            float(BASE_CAMERA_GAINS[camera_id])
-            if reset
-            else parse_float(raw_gain, "gain_db", float(CAMERAS[camera_id]["gain_db"]), -20.0, 12.0)
-        )
+        if "gain_db" in data:
+            raw_gain = data.get("gain_db")
+            reset_gain = raw_gain is None or (
+                isinstance(raw_gain, str) and raw_gain.strip().lower() in {"default", "reset"}
+            )
+            gain_db = (
+                float(BASE_CAMERA_GAINS[camera_id])
+                if reset_gain
+                else parse_float(raw_gain, "gain_db", previous_gain, -20.0, 12.0)
+            )
+        if "volume_level" in data:
+            raw_volume = data.get("volume_level")
+            reset_volume = raw_volume is None or (
+                isinstance(raw_volume, str) and raw_volume.strip().lower() in {"default", "reset"}
+            )
+            volume_level = (
+                float(BASE_CAMERA_VOLUMES[camera_id])
+                if reset_volume
+                else parse_float(raw_volume, "volume_level", previous_volume, 0.0, 1.0)
+            )
     except ConfigError as exc:
         return jsonify({"error": str(exc)}), 400
 
+    # EZVIZ/Hikvision: prefer the local HCNetSDK hardware speaker volume. If
+    # firmware does not implement that command, keep a software DSP fallback so
+    # every camera still has a functional Home Assistant volume control.
+    if "volume_level" in data and cfg.get("vendor", "ezviz") == "ezviz":
+        sender = WORKERS[camera_id].sender
+        try:
+            result = sender.set_volume_level(volume_level)
+            volume_level = float(result["volume_level"])
+            volume_backend = str(result.get("volume_backend") or "hcnetsdk")
+        except Exception as exc:
+            cfg["hardware_volume_active"] = False
+            volume_backend = "software"
+            volume_warning = str(exc)
+
     with runtime_settings_lock:
-        previous_gain = float(CAMERAS[camera_id]["gain_db"])
         previous_runtime = dict(RUNTIME_SETTINGS.get(camera_id) or {})
-        CAMERAS[camera_id]["gain_db"] = gain_db
-        if reset:
-            camera_runtime = dict(previous_runtime)
-            camera_runtime.pop("gain_db", None)
-            if camera_runtime:
-                RUNTIME_SETTINGS[camera_id] = camera_runtime
+        cfg["gain_db"] = gain_db
+        cfg["volume_level"] = volume_level
+        camera_runtime = dict(previous_runtime)
+        if "gain_db" in data:
+            if reset_gain:
+                camera_runtime.pop("gain_db", None)
             else:
-                RUNTIME_SETTINGS.pop(camera_id, None)
-        else:
-            camera_runtime = dict(previous_runtime)
-            camera_runtime["gain_db"] = gain_db
+                camera_runtime["gain_db"] = gain_db
+        if "volume_level" in data:
+            if reset_volume:
+                camera_runtime.pop("volume_level", None)
+            else:
+                camera_runtime["volume_level"] = volume_level
+        if camera_runtime:
             RUNTIME_SETTINGS[camera_id] = camera_runtime
+        else:
+            RUNTIME_SETTINGS.pop(camera_id, None)
         try:
             _save_runtime_settings(RUNTIME_SETTINGS)
         except OSError as exc:
-            CAMERAS[camera_id]["gain_db"] = previous_gain
+            cfg["gain_db"] = previous_gain
+            cfg["volume_level"] = previous_volume
             if previous_runtime:
                 RUNTIME_SETTINGS[camera_id] = previous_runtime
             else:
                 RUNTIME_SETTINGS.pop(camera_id, None)
             return jsonify({"error": f"unable to persist runtime settings: {exc}"}), 500
-    return jsonify({"camera": camera_id, "gain_db": gain_db, "reset": reset})
+
+    response = {
+        "camera": camera_id,
+        "gain_db": gain_db,
+        "volume_level": volume_level,
+        "volume_backend": volume_backend,
+    }
+    if volume_warning:
+        response["volume_warning"] = volume_warning
+    return jsonify(response)
 
 
 @app.get("/jobs/<job_id>")

@@ -136,6 +136,43 @@ public:
 
     LONG user_id() const { return user_id_; }
 
+    bool get_output_volume(int &volume, std::string &error) {
+        if (!login(true)) {
+            error = "login failed error=" + std::to_string((unsigned int)NET_DVR_GetLastError());
+            return false;
+        }
+        NET_DVR_AUDIOOUT_VOLUME cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.dwSize = sizeof(cfg);
+        DWORD returned = 0;
+        if (!NET_DVR_GetDVRConfig(user_id_, NET_DVR_GET_AUDIOOUT_VOLUME, (LONG)voice_chan_,
+                                  &cfg, sizeof(cfg), &returned)) {
+            error = "get output volume failed error=" + std::to_string((unsigned int)NET_DVR_GetLastError());
+            return false;
+        }
+        volume = (int)cfg.byAudioOutVolume;
+        return true;
+    }
+
+    bool set_output_volume(int volume, std::string &error) {
+        if (volume < 0) volume = 0;
+        if (volume > 100) volume = 100;
+        if (!login(true)) {
+            error = "login failed error=" + std::to_string((unsigned int)NET_DVR_GetLastError());
+            return false;
+        }
+        NET_DVR_AUDIOOUT_VOLUME cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.dwSize = sizeof(cfg);
+        cfg.byAudioOutVolume = (BYTE)volume;
+        if (!NET_DVR_SetDVRConfig(user_id_, NET_DVR_SET_AUDIOOUT_VOLUME, (LONG)voice_chan_,
+                                  &cfg, sizeof(cfg))) {
+            error = "set output volume failed error=" + std::to_string((unsigned int)NET_DVR_GetLastError());
+            return false;
+        }
+        return true;
+    }
+
     bool play(const std::string &aac_file, unsigned long &frames_sent, long long &elapsed_ms, std::string &error) {
         // Retry once with a fresh login if the SDK session became stale.
         for (int attempt = 0; attempt < 2; ++attempt) {
@@ -327,6 +364,21 @@ static int run_worker() {
             printf("BYE\n");
             break;
         }
+        if (strcmp(line, "GET_VOLUME") == 0) {
+            int volume = 0;
+            std::string error;
+            if (session.get_output_volume(volume, error)) printf("VOLUME\t%d\n", volume);
+            else printf("ERR\tGET_VOLUME\t%s\n", error.c_str());
+            continue;
+        }
+        const char volume_prefix[] = "SET_VOLUME\t";
+        if (strncmp(line, volume_prefix, sizeof(volume_prefix) - 1) == 0) {
+            int volume = atoi(line + sizeof(volume_prefix) - 1);
+            std::string error;
+            if (session.set_output_volume(volume, error)) printf("VOLUME\t%d\n", volume < 0 ? 0 : (volume > 100 ? 100 : volume));
+            else printf("ERR\tSET_VOLUME\t%s\n", error.c_str());
+            continue;
+        }
 
         if (strcmp(line, "STREAM_BEGIN") == 0) {
             std::string error;
@@ -380,6 +432,19 @@ static int run_worker() {
     return 0;
 }
 
+static int run_volume_once(bool set_value, int requested) {
+    if (!init_hcnetsdk()) return 1;
+    CameraSession session;
+    std::string error;
+    int volume = requested;
+    bool ok = set_value ? session.set_output_volume(volume, error) : session.get_output_volume(volume, error);
+    if (ok) printf("VOLUME=%d\n", volume);
+    else fprintf(stderr, "FAILED: %s\n", error.c_str());
+    session.logout();
+    NET_DVR_Cleanup();
+    return ok ? 0 : 6;
+}
+
 static int run_once(const char *aac_file) {
     if (!init_hcnetsdk()) return 1;
 
@@ -404,10 +469,16 @@ int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--worker") == 0) {
         return run_worker();
     }
+    if (argc == 2 && strcmp(argv[1], "--get-volume") == 0) {
+        return run_volume_once(false, 0);
+    }
+    if (argc == 3 && strcmp(argv[1], "--set-volume") == 0) {
+        return run_volume_once(true, atoi(argv[2]));
+    }
     if (argc == 2) {
         return run_once(argv[1]);
     }
 
-    fprintf(stderr, "Usage: %s /path/file.aac | --worker\n", argv[0]);
+    fprintf(stderr, "Usage: %s /path/file.aac | --worker | --get-volume | --set-volume 0..100\n", argv[0]);
     return 1;
 }

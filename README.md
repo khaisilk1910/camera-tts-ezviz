@@ -1,8 +1,8 @@
-# Camera TTS Multi-Vendor Docker v2.5.1
+# Camera TTS Multi-Vendor Docker v2.6.0
 
 Backend local cho **EZVIZ/Hikvision, Imou và Dahua**, dùng chung một API cho TTS, media, PTZ, Assist audio và đàm thoại hai chiều.
 
-## Kiến trúc v2.5.1
+## Kiến trúc v2.6.0
 
 `vendors` (hoặc `vendor`) trong từng camera quyết định adapter phát loa:
 
@@ -15,15 +15,17 @@ Docker giữ toàn bộ camera I/O. Home Assistant chỉ gọi HTTP API bất đ
 ## Tính năng
 
 - TTS và audio nhiều hãng, queue riêng từng camera: `add`, `next`, `play`, `replace`.
-- Cache + single-flight, convert audio bằng ffmpeg ngoài request thread.
+- Cache + single-flight cho TTS; media URL dài mặc định **stream/transcode theo thời gian thực** để vào tiếng nhanh và Stop được cả khi đang Buffering.
 - EZVIZ dùng persistent HCNetSDK worker; Imou/Dahua chỉ mở talk session khi thật sự phát.
 - PTZ on-demand:
-  - EZVIZ/Hikvision: ISAPI `continuous`.
+  - EZVIZ/Hikvision: HCNetSDK local mặc định; có thể ép ISAPI khi firmware hỗ trợ.
   - Imou/Dahua: Dahua CGI PTZ (bật riêng bằng `ptz:true`).
 - Assist: endpoint upload WAV nội bộ cho câu trả lời TTS của Home Assistant.
 - `mic_url`: HA có thể đọc mic camera/go2rtc bằng ffmpeg và chạy native Assist pipeline.
 - Intercom: cổng riêng `8125`, không chiếm worker API; nhận PCMA 8 kHz từ go2rtc, voice-gate để chỉ mở talk channel khi có người nói và đóng sau khoảng 1,5 giây im lặng.
 - API key cho API chính; intercom dùng token riêng theo camera/HMAC.
+- Volume theo từng camera: EZVIZ/Hikvision ưu tiên HCNetSDK hardware volume 0–100; model không hỗ trợ và Imou/Dahua dùng DSP software fallback. Media streaming áp dụng software volume theo từng chunk nên slider đổi được trong khi nhạc đang chạy.
+- Stop tức thời: hủy job, kill ffmpeg đang mở/probe URL và đóng VoiceTalk nếu đã phát; không cần đợi `MEDIA_PREP_TIMEOUT`.
 - Không probe PTZ/mic/camera phụ trong startup Docker ngoài EZVIZ warm worker hiện hữu.
 
 ## Portainer stack
@@ -71,8 +73,10 @@ services:
       VOICE_START_DELAY_MS: "120"
       VOICE_END_DELAY_MS: "80"
       VOICE_REOPEN_GUARD_MS: "1250"
-      SENDER_START_TIMEOUT: "60"
-      MEDIA_PREP_TIMEOUT: "900"
+      SENDER_START_TIMEOUT: "8"
+      MEDIA_STREAMING: "true"
+      MEDIA_STREAM_CHUNK: "8192"
+      MEDIA_PREP_TIMEOUT: "900" # chỉ dùng khi MEDIA_STREAMING=false
       MEDIA_SEND_TIMEOUT: "7200"
       MEDIA_MAX_URL_LENGTH: "4096"
       ALLOW_REQUEST_OVERRIDES: "true"
@@ -129,6 +133,7 @@ Các khóa mới:
 | Khóa | Ý nghĩa |
 |---|---|
 | `vendors` / `vendor` | `ezviz`, `imou`, `dahua`; `hikvision` được alias về `ezviz` |
+| `volume_level` | âm lượng khởi tạo chuẩn hóa `0.0`–`1.0`; sau đó có thể chỉnh trực tiếp từ `media_player` Home Assistant |
 | `mic_url` | RTSP/HTTP(S) audio source để Home Assistant dùng Assist |
 | `ptz` | bật/tắt PTZ; mặc định `false` |
 | `ptz_protocol` | `auto`, `hcnetsdk`, `isapi`, `dahua`, `none`. `auto`: EZVIZ/Hikvision → HCNetSDK local; Imou/Dahua → Dahua CGI local. |
@@ -149,10 +154,18 @@ curl -X POST http://HOST:8124/say/gate \
   -H "X-API-Key: YOUR_KEY" -H "Content-Type: application/json" \
   -d '{"text":"Xin chào","queue_mode":"add"}'
 
-# Media URL
+# Media URL - mặc định bắt đầu phát theo stream, không tải hết bài trước
 curl -X POST http://HOST:8124/media/gate \
   -H "X-API-Key: YOUR_KEY" -H "Content-Type: application/json" \
   -d '{"url":"https://example.com/audio.mp3","queue_mode":"replace"}'
+
+# Stop ngay cả khi đang Buffering
+curl -X POST http://HOST:8124/stop/gate -H "X-API-Key: YOUR_KEY"
+
+# Volume 0.0..1.0
+curl -X PATCH http://HOST:8124/cameras/gate/settings \
+  -H "X-API-Key: YOUR_KEY" -H "Content-Type: application/json" \
+  -d '{"volume_level":0.65}'
 
 # PTZ
 curl -X POST http://HOST:8124/ptz/gate \
@@ -172,6 +185,12 @@ Gọi service `camera_tts_ezviz.get_intercom_source` trong Home Assistant để 
 
 Backchannel dùng server riêng `INTERCOM_PORT` nên một phiên micro mở lâu **không giữ thread Waitress của API**. Voice activity gate chỉ mở camera talk khi có tiếng nói; khi im ~1,5 giây session đóng để camera trả mic về chiều nghe.
 
+## Âm thanh bản ghi khi đang TTS / phát nhạc
+
+Đường phát EZVIZ/Hikvision hiện dùng HCNetSDK VoiceTalk. Một số firmware consumer chuyển audio path sang chế độ đàm thoại khi VoiceTalk mở nên bản ghi microSD/NVR có thể mất mic trong khoảng đó. Docker v2.6.0 **đóng VoiceTalk ngay khi Stop hoặc khi stream kết thúc**, vì vậy không còn giữ talk channel lâu do Buffering.
+
+Không có một lệnh chung an toàn để ép mọi model vừa VoiceTalk vừa ghi mic. Một số thiết bị Hikvision chuyên dụng công bố capability Audio Mixing/AudioSaveEnable, audio broadcast hoặc RTSP audio riêng; nếu camera không công bố các capability đó thì không nên tự PUT cấu hình ISAPI đoán mò. Với model bị firmware khóa mic trong VoiceTalk, cách bảo toàn âm thanh đáng tin cậy là ghi RTSP audio ở recorder ngoài (NVR/Frigate/go2rtc) hoặc dùng đường audio-broadcast riêng nếu model thực sự hỗ trợ, thay vì coi VoiceTalk là broadcast.
+
 ## Local
 
 - **Docker → camera:** local LAN cho cả 3 vendor.
@@ -185,13 +204,13 @@ Backchannel dùng server riêng `INTERCOM_PORT` nên một phiên micro mở lâ
 
 ISAPI của Hikvision/EZVIZ là giao diện chính thức. Với Imou/Dahua, CGI PTZ là giao diện được dùng rộng rãi trên firmware Dahua-compatible nhưng khả năng có thể khác theo model/firmware. Vì vậy PTZ **không tự probe**, mặc định tắt và chỉ chạy khi đặt `ptz:true`.
 
-## Kiểm thử v2.5.1
+## Kiểm thử v2.6.0
 
 - Python syntax compile cho toàn bộ backend.
 - C++ `send_aac.cpp` compile bằng `g++ -std=c++17 -O2 -Wall -Wextra` với HCNetSDK headers/libs đi kèm.
-- 31 unit/regression tests: config, queue race, single-flight, vendor mapping, PTZ start/stop, A-law, resample và intercom voice gate.
+- 37 unit/regression tests: config/volume, queue race, Stop khi Buffering, live software-volume, single-flight, vendor mapping, PTZ start/stop, A-law, resample và intercom voice gate.
 
-Xem chi tiết tại `CHANGES_2.5.1.md`.
+Xem chi tiết tại `CHANGES_2.6.0.md`.
 
 
 ### PTZ EZVIZ/Hikvision

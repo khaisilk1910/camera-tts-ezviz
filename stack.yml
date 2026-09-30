@@ -48,7 +48,10 @@ services:
       VOICE_REOPEN_GUARD_MS: "1250"
       SENDER_START_TIMEOUT: "8"
 
-      # Phát file/URL nhạc qua media_player Home Assistant.
+      # Phát nhạc theo luồng để vào tiếng nhanh và Stop được ngay cả khi đang Buffering.
+      MEDIA_STREAMING: "true"
+      MEDIA_STREAM_CHUNK: "8192"
+      # Chỉ dùng MEDIA_PREP_TIMEOUT khi tắt MEDIA_STREAMING để quay về chế độ tải/chuyển mã toàn file.
       MEDIA_PREP_TIMEOUT: "900"
       MEDIA_SEND_TIMEOUT: "7200"
       MEDIA_MAX_URL_LENGTH: "4096"
